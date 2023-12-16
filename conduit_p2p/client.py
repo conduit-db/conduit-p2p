@@ -23,7 +23,7 @@ from .types import (
     BlockChunkData,
     BlockDataMsg,
 )
-from .commands import BLOCK, EXTMSG, VERACK
+from .commands import BLOCK, EXTMSG, VERACK, TX, BLOCKTXN
 from .utils import create_task
 
 MODULE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -177,6 +177,10 @@ class BitcoinClient:
                     await self.message_queue.put((header.command, payload))
             elif header.command == BLOCK:
                 await self.handle_big_block(stream, header.length)
+            else:
+                # tx, cmpctblock, blocktxn, getblocktxn can be large
+                payload = await self.read_small_payload(stream, header)
+                await self.message_queue.put((header.command, payload))
 
     async def wait_for_connection(self) -> None:
         """Keep retrying until the node comes online"""

@@ -26,11 +26,11 @@ It aims to be as simple as possible without needlessly sacrificing performance f
 The API is based around handlers / callbacks because this is how the p2p network was fundamentally 
 designed - a high throughput, asynchronous relay network.
 
-The constructor of the example `MyApplicationHandlers` below is where you could add significant application state
+The constructor of the example `SPVApplicationHandlers` below is where you could add significant application state
 to push messages into queues, write to files or databases, trigger events, route messages to worker
 processes for parsing, update a redis cache etc. 
 
-There is a single instance of the `MyApplicationHandlers` which is shared by all `BitcoinClient` connections. Within
+There is a single instance of the `SPVApplicationHandlers` which is shared by all `BitcoinClient` connections. Within
 each handler, you can access both:
 
 - The `BitcoinClient` that made the original request
