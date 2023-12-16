@@ -517,3 +517,8 @@ async def test_big_block_exceeding_network_buffer_capacity() -> None:
                 pass
         if client:
             await client.close()
+
+
+@pytest.mark.asyncio
+def test_transaction_exceeding_large_message_limit() -> None:
+    pytest.xfail("Not tested yet")
