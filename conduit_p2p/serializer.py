@@ -102,9 +102,8 @@ class Serializer:
     def verack(self) -> bytes:
         return self.payload_to_message(VERACK_BIN, b"")
 
-    def tx(self, rawtx: str) -> bytes:
-        payload = bytes.fromhex(rawtx)
-        return self.payload_to_message(TX_BIN, payload)
+    def tx(self, rawtx: bytes) -> bytes:
+        return self.payload_to_message(TX_BIN, rawtx)
 
     async def inv(self, inv_vects: List[Inv]) -> bytes:
         payload = bytearray()

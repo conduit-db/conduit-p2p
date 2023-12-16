@@ -5,8 +5,8 @@
 # Licensed under the MIT License; see LICENCE for details.
 
 import array
-import asyncio
 import enum
+from enum import IntEnum
 from typing import NamedTuple
 
 
@@ -68,12 +68,6 @@ class BigBlock(NamedTuple):
 SmallBlocks = list[bytes]
 
 
-class BitcoinPeerInstance(NamedTuple):
-    reader: asyncio.StreamReader
-    writer: asyncio.StreamWriter
-    host: str
-    port: int
-    peer_id: int
-
-    async def send_message(self, message: bytes) -> None:
-        self.writer.write(message)
+class InvType(IntEnum):
+    TX = 1
+    BLOCK = 2

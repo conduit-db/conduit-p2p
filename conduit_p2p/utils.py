@@ -119,19 +119,6 @@ def bin_p2p_command_to_ascii(bin_command: bytes) -> str:
     return bin_command.rstrip(bytes(1)).decode()
 
 
-def network_str_to_bitcoinx_network(network: str) -> bitcoinx.Network:
-    if network == MAINNET:
-        return bitcoinx.Bitcoin
-    elif network == TESTNET:
-        return bitcoinx.BitcoinTestnet
-    elif network == SCALINGTESTNET:
-        return bitcoinx.BitcoinScalingTestnet
-    elif network == REGTEST:
-        return bitcoinx.BitcoinRegtest
-    else:
-        raise NotImplementedError(f"Unrecognized network type: '{network}'")
-
-
 def cast_to_valid_ipv4(ipv4: str) -> str:
     """Resolve the IP address - important for docker usage"""
     try:

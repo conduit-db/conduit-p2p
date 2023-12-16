@@ -7,7 +7,6 @@
 import asyncio
 import bitcoinx
 from bitcoinx import double_sha256, hash_to_hex_str, pack_varint, hex_str_to_hash
-import time
 import io
 import unittest
 from math import ceil
@@ -24,10 +23,9 @@ from conduit_p2p.client_manager import BitcoinClientManager
 from conduit_p2p.types import (
     BlockChunkData,
     BlockDataMsg,
-    BitcoinPeerInstance,
     BlockType,
 )
-from conduit_p2p.commands import INV, BLOCK_BIN, BLOCK
+from conduit_p2p.commands import BLOCK_BIN, BLOCK
 from conduit_p2p.constants import REGTEST, ZERO_HASH
 from conduit_p2p import commands
 from conduit_p2p.handlers import HandlersDefault
@@ -35,7 +33,6 @@ from conduit_p2p import (
     BitcoinClient,
     NetworkConfig,
     Serializer,
-    Deserializer,
 )
 from scripts.import_blocks import import_blocks
 
@@ -82,72 +79,75 @@ class MockHandlers(HandlersDefault):
     `received_message_queue` would not be a part of this handler class under normal circumstances
     """
 
-    def __init__(self, net_config: NetworkConfig, received_message_queue: asyncio.Queue) -> None:
-        super().__init__(net_config)
+    def __init__(self, network_type: str, received_message_queue: asyncio.Queue) -> None:
+        super().__init__(network_type=network_type)
+        self.logger.setLevel(logging.WARNING)
         self.received_message_queue = received_message_queue
+        self.getdata_txs_all = True
+        self.getdata_blocks_all = True
 
-    async def on_version(self, message: bytes, peer: BitcoinPeerInstance) -> None:
+    async def on_version(self, message: bytes, peer: BitcoinClient) -> None:
         await super().on_version(message, peer)
         self.received_message_queue.put_nowait((commands.VERSION, message, peer))
 
-    async def on_verack(self, message: bytes, peer: BitcoinPeerInstance) -> None:
+    async def on_verack(self, message: bytes, peer: BitcoinClient) -> None:
         await super().on_verack(message, peer)
         self.received_message_queue.put_nowait((commands.VERACK, message, peer))
 
-    async def on_protoconf(self, message: bytes, peer: BitcoinPeerInstance) -> None:
+    async def on_protoconf(self, message: bytes, peer: BitcoinClient) -> None:
         await super().on_protoconf(message, peer)
         self.received_message_queue.put_nowait((commands.PROTOCONF, message, peer))
 
-    async def on_sendheaders(self, message: bytes, peer: BitcoinPeerInstance) -> None:
+    async def on_sendheaders(self, message: bytes, peer: BitcoinClient) -> None:
         await super().on_sendheaders(message, peer)
         self.received_message_queue.put_nowait((commands.SENDHEADERS, message, peer))
 
-    async def on_sendcmpct(self, message: bytes, peer: BitcoinPeerInstance) -> None:
+    async def on_sendcmpct(self, message: bytes, peer: BitcoinClient) -> None:
         await super().on_sendcmpct(message, peer)
         self.received_message_queue.put_nowait((commands.SENDCMPCT, message, peer))
 
-    async def on_ping(self, message: bytes, peer: BitcoinPeerInstance) -> None:
+    async def on_ping(self, message: bytes, peer: BitcoinClient) -> None:
         await super().on_ping(message, peer)
         self.received_message_queue.put_nowait((commands.PING, message, peer))
 
-    async def on_pong(self, message: bytes, peer: BitcoinPeerInstance) -> None:
+    async def on_pong(self, message: bytes, peer: BitcoinClient) -> None:
         await super().on_pong(message, peer)
         self.received_message_queue.put_nowait((commands.PONG, message, peer))
 
-    async def on_addr(self, message: bytes, peer: BitcoinPeerInstance) -> None:
+    async def on_addr(self, message: bytes, peer: BitcoinClient) -> None:
         await super().on_addr(message, peer)
         self.received_message_queue.put_nowait((commands.ADDR, message, peer))
 
-    async def on_feefilter(self, message: bytes, peer: BitcoinPeerInstance) -> None:
+    async def on_feefilter(self, message: bytes, peer: BitcoinClient) -> None:
         await super().on_feefilter(message, peer)
         self.received_message_queue.put_nowait((commands.FEEFILTER, message, peer))
 
-    async def on_authch(self, message: bytes, peer: BitcoinPeerInstance) -> None:
+    async def on_authch(self, message: bytes, peer: BitcoinClient) -> None:
         await super().on_authch(message, peer)
         self.received_message_queue.put_nowait((commands.AUTHCH, message, peer))
 
-    async def on_inv(self, message: bytes, peer: BitcoinPeerInstance,
+    async def on_inv(self, message: bytes, peer: BitcoinClient,
             getdata_txs_all: bool = False, getdata_blocks_all: bool = False) -> None:
-        await super().on_inv(message, peer, getdata_txs_all=True, getdata_blocks_all=True)
+        await super().on_inv(message, peer)
         self.received_message_queue.put_nowait((commands.INV, message, peer))
 
-    async def on_getdata(self, message: bytes, peer: BitcoinPeerInstance) -> None:
+    async def on_getdata(self, message: bytes, peer: BitcoinClient) -> None:
         await super().on_getdata(message, peer)
         self.received_message_queue.put_nowait((commands.GETDATA, message, peer))
 
-    async def on_headers(self, message: bytes, peer: BitcoinPeerInstance) -> None:
+    async def on_headers(self, message: bytes, peer: BitcoinClient) -> None:
         await super().on_headers(message, peer)
         self.received_message_queue.put_nowait((commands.HEADERS, message, peer))
 
-    async def on_tx(self, message: bytes, peer: BitcoinPeerInstance) -> None:
+    async def on_tx(self, message: bytes, peer: BitcoinClient) -> None:
         await super().on_tx(message, peer)
         self.received_message_queue.put_nowait((commands.TX, message, peer))
 
-    async def on_block_chunk(self, block_chunk_data: BlockChunkData, peer: BitcoinPeerInstance) -> None:
+    async def on_block_chunk(self, block_chunk_data: BlockChunkData, peer: BitcoinClient) -> None:
         await super().on_block_chunk(block_chunk_data, peer)
         self.received_message_queue.put_nowait((commands.BLOCK, block_chunk_data, peer))
 
-    async def on_block(self, block_data_msg: BlockDataMsg, peer: BitcoinPeerInstance) -> None:
+    async def on_block(self, block_data_msg: BlockDataMsg, peer: BitcoinClient) -> None:
         await super().on_block(block_data_msg, peer)
         self.received_message_queue.put_nowait((commands.BLOCK, block_data_msg, peer))
 
@@ -181,9 +181,8 @@ async def test_handshake() -> None:
     client = None
     try:
         received_message_queue = asyncio.Queue()
-        net_config = NetworkConfig(REGTEST, REGTEST_NODE_HOST, REGTEST_NODE_PORT)
-        message_handler = MockHandlers(net_config, received_message_queue)
-        client = BitcoinClient(1, REGTEST_NODE_HOST, REGTEST_NODE_PORT, message_handler, net_config)
+        message_handler = MockHandlers(REGTEST, received_message_queue)
+        client = BitcoinClient(1, REGTEST_NODE_HOST, REGTEST_NODE_PORT, message_handler)
         await client.connect()
 
         expected_message_commands = {
@@ -203,7 +202,7 @@ async def test_handshake() -> None:
         assert client.handshake_complete_event.is_set()
     finally:
         if client:
-            await client.close_connection()
+            await client.close()
 
 
 @pytest.mark.asyncio
@@ -214,9 +213,8 @@ async def test_getheaders_request_and_headers_response() -> None:
     client = None
     try:
         received_message_queue = asyncio.Queue()
-        net_config = NetworkConfig(REGTEST, REGTEST_NODE_HOST, REGTEST_NODE_PORT)
-        message_handler = MockHandlers(net_config, received_message_queue)
-        client = BitcoinClient(1, REGTEST_NODE_HOST, REGTEST_NODE_PORT, message_handler, net_config)
+        message_handler = MockHandlers(REGTEST, received_message_queue)
+        client = BitcoinClient(1, REGTEST_NODE_HOST, REGTEST_NODE_PORT, message_handler)
         await client.connect()
 
         expected_message_commands = {
@@ -231,13 +229,11 @@ async def test_getheaders_request_and_headers_response() -> None:
         }
         await _drain_handshake_messages(client, message_handler, expected_message_commands)
 
-        serializer = Serializer(net_config)
-        message = serializer.getheaders(1, block_locator_hashes=[ZERO_HASH], hash_stop=ZERO_HASH)
-        await client.send_message(message)
+        message = client.serializer.getheaders(1, block_locator_hashes=[ZERO_HASH], hash_stop=ZERO_HASH)
+        client.send_message(message)
 
-        deserializer = Deserializer(net_config)
         command, message, peer = await message_handler.received_message_queue.get()
-        headers = deserializer.headers(io.BytesIO(message))
+        headers = client.deserializer.headers(io.BytesIO(message))
         node_rpc_result = electrumsv_node.call_any("getinfo").json()["result"]
         height = node_rpc_result["blocks"]
         assert len(headers) == height
@@ -245,7 +241,7 @@ async def test_getheaders_request_and_headers_response() -> None:
         assert headers_count == len(headers)
     finally:
         if client:
-            await client.close_connection()
+            await client.close()
 
 
 @pytest.mark.asyncio
@@ -256,13 +252,10 @@ async def test_peer_manager():
     peer_manager = None
     try:
         received_message_queue = asyncio.Queue()
-        net_config = NetworkConfig(REGTEST, REGTEST_NODE_HOST, REGTEST_NODE_PORT)
-        message_handler = MockHandlers(net_config, received_message_queue)
-        client = BitcoinClient(1, REGTEST_NODE_HOST, REGTEST_NODE_PORT, message_handler, net_config)
-        client2 = BitcoinClient(2, REGTEST_NODE_HOST, REGTEST_NODE_PORT, message_handler, net_config)
-        client3 = BitcoinClient(3, REGTEST_NODE_HOST, REGTEST_NODE_PORT, message_handler, net_config)
-        peer_manager = BitcoinClientManager(clients=[client, client2, client3])
-        await peer_manager.try_connect_to_all_peers()
+        message_handler = MockHandlers(REGTEST, received_message_queue)
+        peers_list = ["127.0.0.1:18444", "127.0.0.1:18444", "127.0.0.1:18444"]
+        peer_manager = BitcoinClientManager(message_handler, peers_list=peers_list)
+        await peer_manager.connect_all_peers()
         assert len(peer_manager.get_connected_peers()) == len(peer_manager.clients) == 3
 
         # No index out of range
@@ -298,21 +291,19 @@ async def test_peer_manager():
         for i in range(3*len(expected_message_commands)):
             command, message, peer = await message_handler.received_message_queue.get()
             if command == 'version':
-                logger.debug(f"peer.peer_id: {peer.peer_id}")
-            peer_map[peer.peer_id].remove(command)
+                logger.debug(f"peer_id: {peer.id}")
+            peer_map[peer.id].remove(command)
         assert len(peer_map[1]) == 0 and len(peer_map[2]) == 0 and len(peer_map[3]) == 0
 
         for i in range(len(peer_manager.clients)):
             peer_manager.select_next_peer()
             client = peer_manager.get_current_peer()
-            serializer = Serializer(net_config)
-            message = serializer.getheaders(
+            message = client.serializer.getheaders(
                 1, block_locator_hashes=[hex_str_to_hash(locator_hashes[0])], hash_stop=ZERO_HASH
             )
-            await client.send_message(message)
-            deserializer = Deserializer(net_config)
+            client.send_message(message)
             command, message, peer = await message_handler.received_message_queue.get()
-            headers = deserializer.headers(io.BytesIO(message))
+            headers = client.deserializer.headers(io.BytesIO(message))
             node_rpc_result = electrumsv_node.call_any('getinfo').json()['result']
             height = node_rpc_result['blocks']
             assert len(headers) == height
@@ -328,14 +319,12 @@ async def test_getblocks_request_and_blocks_response():
     client = None
     try:
         received_message_queue = asyncio.Queue()
-        net_config = NetworkConfig(REGTEST, REGTEST_NODE_HOST, REGTEST_NODE_PORT)
-        message_handler = MockHandlers(net_config, received_message_queue)
+        message_handler = MockHandlers(REGTEST, received_message_queue)
         client = BitcoinClient(
             1,
             REGTEST_NODE_HOST,
             REGTEST_NODE_PORT,
             message_handler,
-            net_config,
         )
         await client.connect()
 
@@ -351,11 +340,9 @@ async def test_getblocks_request_and_blocks_response():
         }
         await _drain_handshake_messages(client, message_handler, expected_message_commands)
 
-        serializer = Serializer(net_config)
-        message = serializer.getblocks(1, block_locator_hashes=[ZERO_HASH], hash_stop=ZERO_HASH)
-        await client.send_message(message)
+        message = client.serializer.getblocks(1, block_locator_hashes=[ZERO_HASH], hash_stop=ZERO_HASH)
+        client.send_message(message)
 
-        deserializer = Deserializer(net_config)
 
         node_rpc_result = electrumsv_node.call_any("getinfo").json()["result"]
         height = node_rpc_result["blocks"]
@@ -374,7 +361,7 @@ async def test_getblocks_request_and_blocks_response():
             # node_rpc_result = electrumsv_node.call_any("getblock", hash_to_hex_str(block_hash)).json()[
             #     "result"
             # ]
-            header, block_txs = deserializer.block(io.BytesIO(message.small_block_data))
+            header, block_txs = client.deserializer.block(io.BytesIO(message.small_block_data))
             # assert node_rpc_result["num_tx"] == len(block_txs)
             txs_count, offset = unpack_varint(message.small_block_data[80:89], 0)
             assert txs_count == len(block_txs)
@@ -382,7 +369,7 @@ async def test_getblocks_request_and_blocks_response():
                 break
     finally:
         if client:
-            await client.close_connection()
+            await client.close()
 
 
 def _parse_txs_with_bitcoinx(message: BlockChunkData) -> None:
@@ -409,7 +396,7 @@ async def test_big_block_exceeding_network_buffer_capacity() -> None:
     client = None
     task = None
     try:
-        net_config = NetworkConfig(REGTEST, REGTEST_NODE_HOST, REGTEST_NODE_PORT)
+        net_config = NetworkConfig(REGTEST)
         serializer = Serializer(net_config)
         fake_header_block_116 = bytes.fromhex("000000201b94e4366e4d283d1cd3834aed03b4fd0be15fcc6ab4e387df04f08ddff47736bc86ff7435135f70a33a9105551b0ea7719b9fb2c0a7e882976b3b977985adab2189f461ffff7f2001000000")
         block_hash = double_sha256(fake_header_block_116)
@@ -424,7 +411,7 @@ async def test_big_block_exceeding_network_buffer_capacity() -> None:
         message_to_send = serializer.payload_to_message(BLOCK_BIN, big_block)
         received_message_queue = asyncio.Queue()
 
-        message_handler = MockHandlers(net_config, received_message_queue)
+        message_handler = MockHandlers(REGTEST, received_message_queue)
 
         reader = asyncio.StreamReader()
         writer = unittest.mock.Mock()
@@ -433,16 +420,15 @@ async def test_big_block_exceeding_network_buffer_capacity() -> None:
             REGTEST_NODE_HOST,
             REGTEST_NODE_PORT,
             message_handler,
-            net_config,
             reader=reader,
             writer=writer,
         )
-        client.LARGE_MESSAGE_LIMIT = 500000
+        client.large_message_limit = 500000
         client.reader.feed_data(message_to_send)
         client.peer = unittest.mock.Mock()
 
         task = create_task(client.start_session())
-        expected_msg_count = 3  # 2 x BlockChunkData; 1 x BlockDataMsg for the full block
+        expected_msg_count = 4  # 2 x BlockChunkData; 1 x BlockDataMsg for the full block
         msg_count = 0
         for i in range(expected_msg_count):
             command, message, peer = await message_handler.received_message_queue.get()
@@ -521,7 +507,7 @@ async def test_big_block_exceeding_network_buffer_capacity() -> None:
                 ]
                 assert message.block_size == 1052049
                 assert message.small_block_data == None
-
+                assert message.block_size == len(big_block)
     finally:
         if task:
             try:
@@ -530,4 +516,4 @@ async def test_big_block_exceeding_network_buffer_capacity() -> None:
             except asyncio.TimeoutError:
                 pass
         if client:
-            await client.close_connection()
+            await client.close()

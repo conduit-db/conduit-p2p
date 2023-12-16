@@ -21,7 +21,7 @@ class SPVApplicationHandlers(HandlersDefault):
         for header in headers:
             self.logger.debug(f"header: {header}")
 
-        await self.client_manager.close()  # <-- This will exit the listening loop and close all connections gracefully
+        await peer.close()  # <-- This will exit the listening loop and close all connections gracefully
 
     async def on_inv(self, message: bytes, peer: BitcoinClient) -> None:
         inv_vect = self.deserializer.inv(io.BytesIO(message))
@@ -34,23 +34,16 @@ class SPVApplicationHandlers(HandlersDefault):
 
 async def main():
     message_handler = SPVApplicationHandlers(REGTEST)
-    peers_list = ["127.0.0.1:18444", "127.0.0.1:18444", "127.0.0.1:18444"]
-
-    async with BitcoinClientManager(message_handler, peers_list) as client_manager:
-        rawtx: bytes = b"raw transaction goes here"
-        for _ in range(len(client_manager.clients)):
-            client = client_manager.get_next_peer()
-            client.broadcast_transaction(rawtx)
-
-        message = client.serializer.getheaders(
-            hash_count=1,
-            block_locator_hashes=[bytes.fromhex("0000000000000000000000000000000000000000000000000000000000000000")],
-            hash_stop=bytes.fromhex("0000000000000000000000000000000000000000000000000000000000000000")
-        )
-        client.send_message(message)
-        # blocks until `await client_manager.close()` is called above in the `on_headers` handler
-        # You could also enter an app main loop or wait for an event from the handler
-        await client_manager.listen()
+    client = BitcoinClient(1, remote_host="127.0.0.1", remote_port=18444, message_handler=message_handler)
+    await client.connect()
+    message = client.serializer.getheaders(
+        hash_count=1,
+        block_locator_hashes=[bytes.fromhex("0000000000000000000000000000000000000000000000000000000000000000")],
+        hash_stop=bytes.fromhex("0000000000000000000000000000000000000000000000000000000000000000")
+    )
+    client.send_message(message)
+    await client.listen()
+    # Do something else after having received the headers
 
 
 asyncio.run(main())

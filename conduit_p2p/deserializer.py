@@ -20,12 +20,15 @@ from bitcoinx import (
     read_varint,
     read_le_uint16,
     unpack_header,
-    Tx, read_be_uint16,
+    Tx,
+    read_be_uint16,
 )
 
 from .constants import CCODES
 from .networks import NetworkConfig
 from io import BytesIO
+
+from .types import InvType
 
 logger = logging.getLogger("deserializer")
 
@@ -82,7 +85,7 @@ class Protoconf(TypedDict):
 
 
 class Inv(TypedDict):
-    inv_type: int
+    inv_type: InvType
     inv_hash: str
 
 

@@ -1,1 +1,1 @@
-bitcoinx==0.7.1
+bitcoinx
