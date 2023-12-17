@@ -71,3 +71,31 @@ SmallBlocks = list[bytes]
 class InvType(IntEnum):
     TX = 1
     BLOCK = 2
+
+
+class BlockHeader(NamedTuple):
+    version: int
+    prev_block: bytes
+    merkle_root: bytes
+    timestamp: int
+    bits: int
+    nonce: int
+    raw: bytes
+    hash: bytes
+
+
+class BitcoinClientMode(IntEnum):
+    SIMPLE = 1
+    ADVANCED = 2
+
+
+class Reject(NamedTuple):
+    message: str
+    ccode_translation: str
+    reason: str
+    item_hash: str
+
+
+class BroadcastResult(NamedTuple):
+    rejected: Reject | None
+    relaying_peer_ids: list[int]

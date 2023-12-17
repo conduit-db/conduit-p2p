@@ -7,14 +7,14 @@ import abc
 import io
 import logging
 import typing
-from math import ceil
+from asyncio import QueueFull
 
-from bitcoinx import hash_to_hex_str, double_sha256
+from bitcoinx import hash_to_hex_str, double_sha256, hex_str_to_hash
 
 from .deserializer import Deserializer
 from .networks import NetworkConfig
 from .serializer import Serializer
-from .types import BlockChunkData, BlockDataMsg, BlockType, InvType
+from .types import BlockChunkData, BlockDataMsg, BlockType, InvType, BitcoinClientMode
 
 if typing.TYPE_CHECKING:
     from .client_manager import BitcoinClientManager
@@ -32,13 +32,12 @@ class HandlersDefault(abc.ABC):
         self.serializer = Serializer(self.net_config)
         self.deserializer = Deserializer(self.net_config)
         self.logger = logging.getLogger("conduit-p2p-handlers")
+        self.logger.setLevel(logging.DEBUG)
         self.client_manager: 'BitcoinClientManager | None' = None
-
-        self.getdata_txs_all: bool = False
-        self.getdata_blocks_all: bool = False
 
     async def on_version(self, message: bytes, peer: 'BitcoinClient') -> None:
         version = self.deserializer.version(io.BytesIO(message))
+        peer.remote_start_height = version['start_height']
         self.logger.debug("Received version: %s (peer_id=%s)", version, peer.id)
         verack_message = self.serializer.verack()
         self.logger.debug("Sending verack")
@@ -84,41 +83,45 @@ class HandlersDefault(abc.ABC):
         inv_vect = self.deserializer.inv(io.BytesIO(message))
         self.logger.debug("Received inv: %s (peer_id=%s)", inv_vect, peer.id)
 
-        if not self.getdata_txs_all and not self.getdata_blocks_all:
-            return
+        if peer.mode == BitcoinClientMode.SIMPLE:
+            # Add peer id to list of `relaying_peer_ids` for the transaction_broadcast
+            if self.client_manager is not None and len(self.client_manager.tx_inv_queue_map) > 0:
+                for inv in inv_vect:
+                    if inv['inv_type'] == InvType.TX:
+                        tx_hash = hex_str_to_hash(inv['inv_hash'])
+                        if tx_hash in self.client_manager.tx_inv_queue_map:
+                            self.client_manager.tx_inv_queue_map[tx_hash].append(peer.id)
 
-        tx_inv_vect = []
-        block_inv_vect = []
-        for inv in inv_vect:
-            # TX
-            if inv["inv_type"] == InvType.TX:
-                tx_inv_vect.append(inv)
-
-            # BLOCK
-            elif inv["inv_type"] == InvType.BLOCK:
-                block_inv_vect.append(inv)
-
-        if block_inv_vect and self.getdata_blocks_all:
-            max_getdata_size = 50_000
-            num_getdatas = ceil(len(block_inv_vect) / max_getdata_size)
-            for i in range(num_getdatas):
-                getdata_msg = self.serializer.getdata(block_inv_vect[i : (i + 1) * max_getdata_size])
-                peer.send_message(getdata_msg)
-
-        if tx_inv_vect and self.getdata_txs_all:
-            max_getdata_size = 50_000
-            num_getdatas = ceil(len(tx_inv_vect) / max_getdata_size)
-            for i in range(num_getdatas):
-                getdata_msg = self.serializer.getdata(tx_inv_vect[i : (i + 1) * max_getdata_size])
-                peer.send_message(getdata_msg)
+            try:
+                peer.inv_queue.put_nowait(inv_vect)
+            except QueueFull:
+                self.logger.warning("Inv queue is full. Are you draining it? "
+                                    "This will block all handler tasks until it is cleared!")
+                await peer.inv_queue.put(inv_vect)
 
     async def on_getdata(self, message: bytes, peer: 'BitcoinClient') -> None:
         getdata = self.deserializer.getdata(io.BytesIO(message))
         self.logger.debug("Received getdata: %s (peer_id=%s)", getdata, peer.id)
 
     async def on_headers(self, message: bytes, peer: 'BitcoinClient') -> None:
-        headers = self.deserializer.headers(io.BytesIO(message))
-        self.logger.debug("Received headers: %s (peer_id=%s)", headers, peer.id)
+        optional_message: bytes | None = message
+        if message[0:1] == b"\x00":
+            optional_message = None
+
+        if peer.mode == BitcoinClientMode.SIMPLE:
+            try:
+                peer.headers_queue.put_nowait(optional_message)
+            except QueueFull:
+                self.logger.warning("Headers queue is full. Are you draining it? "
+                                    "This will block all handler tasks until it is cleared!")
+                await peer.headers_queue.put(optional_message)
+            return
+
+        if optional_message:
+            headers = self.deserializer.headers(io.BytesIO(message))
+            self.logger.debug("Received headers: %s (peer_id=%s)", headers, peer.id)
+        else:
+            self.logger.debug("No headers returned (peer_id=%s)", peer.id)
 
     async def on_tx(self, rawtx: bytes, peer: 'BitcoinClient') -> None:
         tx = self.deserializer.tx(io.BytesIO(rawtx))
@@ -126,6 +129,9 @@ class HandlersDefault(abc.ABC):
 
     async def on_reject(self, message: bytes, peer: 'BitcoinClient') -> None:
         reject_msg = self.deserializer.reject(io.BytesIO(message))
+        if peer.mode == BitcoinClientMode.SIMPLE:
+            peer.tx_reject_queue_map[hex_str_to_hash(reject_msg.item_hash)] = reject_msg
+            return
         self.logger.debug("Received reject: %s (peer_id=%s)", reject_msg, peer.id)
 
     async def on_block_chunk(self, block_chunk_data: BlockChunkData, peer: 'BitcoinClient') -> None:

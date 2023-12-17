@@ -13,7 +13,6 @@ from math import ceil
 from pathlib import Path
 from typing import cast, Coroutine, Any, TypeVar
 import unittest.mock
-import electrumsv_node
 import pytest
 import logging
 import os
@@ -23,7 +22,7 @@ from conduit_p2p.client_manager import BitcoinClientManager
 from conduit_p2p.types import (
     BlockChunkData,
     BlockDataMsg,
-    BlockType,
+    BlockType, BitcoinClientMode, InvType, BroadcastResult, BlockHeader,
 )
 from conduit_p2p.commands import BLOCK_BIN, BLOCK
 from conduit_p2p.constants import REGTEST, ZERO_HASH
@@ -36,6 +35,7 @@ from conduit_p2p import (
 )
 from scripts.import_blocks import import_blocks
 
+from .conftest import call_any
 from .data.big_data_carrier_tx import DATA_CARRIER_TX
 
 MODULE_DIR = Path(os.path.dirname(os.path.abspath(__file__)))
@@ -129,7 +129,17 @@ class MockHandlers(HandlersDefault):
     async def on_inv(self, message: bytes, peer: BitcoinClient,
             getdata_txs_all: bool = False, getdata_blocks_all: bool = False) -> None:
         await super().on_inv(message, peer)
-        self.received_message_queue.put_nowait((commands.INV, message, peer))
+
+        # Modify this handler to request all TX and all BLOCK data
+        inv_vect = peer.deserializer.inv(io.BytesIO(message))
+        for inv in inv_vect:
+            # TX
+            if inv["inv_type"] == InvType.TX:
+                peer.send_message(self.serializer.getdata([inv]))
+
+            # BLOCK
+            if inv["inv_type"] == InvType.BLOCK:
+                peer.send_message(self.serializer.getdata([inv]))
 
     async def on_getdata(self, message: bytes, peer: BitcoinClient) -> None:
         await super().on_getdata(message, peer)
@@ -208,7 +218,7 @@ async def test_handshake() -> None:
 @pytest.mark.asyncio
 async def test_getheaders_request_and_headers_response() -> None:
     # Otherwise the node might still be in initial block download mode (ignores header requests)
-    electrumsv_node.call_any("generate", 1)
+    call_any("generate", 1)
 
     client = None
     try:
@@ -234,7 +244,7 @@ async def test_getheaders_request_and_headers_response() -> None:
 
         command, message, peer = await message_handler.received_message_queue.get()
         headers = client.deserializer.headers(io.BytesIO(message))
-        node_rpc_result = electrumsv_node.call_any("getinfo").json()["result"]
+        node_rpc_result = call_any("getinfo").json()["result"]
         height = node_rpc_result["blocks"]
         assert len(headers) == height
         headers_count, offset = unpack_varint(message, 0)
@@ -247,7 +257,7 @@ async def test_getheaders_request_and_headers_response() -> None:
 @pytest.mark.asyncio
 async def test_peer_manager():
     # Otherwise the node might still be in initial block download mode (ignores header requests)
-    electrumsv_node.call_any('generate', 1)
+    call_any('generate', 1)
 
     peer_manager = None
     try:
@@ -304,7 +314,7 @@ async def test_peer_manager():
             client.send_message(message)
             command, message, peer = await message_handler.received_message_queue.get()
             headers = client.deserializer.headers(io.BytesIO(message))
-            node_rpc_result = electrumsv_node.call_any('getinfo').json()['result']
+            node_rpc_result = call_any('getinfo').json()['result']
             height = node_rpc_result['blocks']
             assert len(headers) == height
             headers_count, offset = unpack_varint(message, 0)
@@ -325,6 +335,7 @@ async def test_getblocks_request_and_blocks_response():
             REGTEST_NODE_HOST,
             REGTEST_NODE_PORT,
             message_handler,
+            mode=BitcoinClientMode.ADVANCED
         )
         await client.connect()
 
@@ -343,8 +354,7 @@ async def test_getblocks_request_and_blocks_response():
         message = client.serializer.getblocks(1, block_locator_hashes=[ZERO_HASH], hash_stop=ZERO_HASH)
         client.send_message(message)
 
-
-        node_rpc_result = electrumsv_node.call_any("getinfo").json()["result"]
+        node_rpc_result = call_any("getinfo").json()["result"]
         height = node_rpc_result["blocks"]
 
         count_blocks_received = 0
@@ -358,7 +368,7 @@ async def test_getblocks_request_and_blocks_response():
             message = cast(BlockDataMsg, message)
             raw_header = message.small_block_data[0:80]
             block_hash = double_sha256(raw_header)
-            # node_rpc_result = electrumsv_node.call_any("getblock", hash_to_hex_str(block_hash)).json()[
+            # node_rpc_result = call_any("getblock", hash_to_hex_str(block_hash)).json()[
             #     "result"
             # ]
             header, block_txs = client.deserializer.block(io.BytesIO(message.small_block_data))
@@ -522,3 +532,72 @@ async def test_big_block_exceeding_network_buffer_capacity() -> None:
 @pytest.mark.asyncio
 def test_transaction_exceeding_large_message_limit() -> None:
     pytest.xfail("Not tested yet")
+
+
+@pytest.mark.asyncio
+async def test_transaction_broadcast() -> None:
+    # There a quirk with the p2p network where a node will only respond with a rejection
+    # on the first time for the current block. On subsequent broadcasts there will be
+    # radio silence which can be misinterpreted as implicit acceptance
+    # I want this example to behave as expected, so I mine a new regtest block each time.
+    call_any('generate', 1)
+    logging.basicConfig(format="%(asctime)-25s %(levelname)-10s %(name)-28s %(message)s")
+    logger = logging.getLogger('main')
+    logger.setLevel(logging.DEBUG)
+    message_handler = HandlersDefault(REGTEST)
+    peers_list = ["127.0.0.1:18444", "127.0.0.1:18444", "127.0.0.1:18444"]
+
+    async with BitcoinClientManager(message_handler, peers_list,
+            mode=BitcoinClientMode.SIMPLE) as client_manager:
+
+        # ccode_translation=REJECT_MALFORMED
+        rawtx: bytes = b"raw transaction goes here"
+        result: BroadcastResult = await client_manager.broadcast_transaction_and_listen(rawtx,
+            broadcast_peer_count=1)
+        assert result.rejected is not None
+        assert result.rejected.message == 'tx'
+        assert result.rejected.ccode_translation == "REJECT_MALFORMED"
+        assert result.rejected.reason == 'error parsing message'
+        assert result.rejected.item_hash == ''
+
+        # Random tx from testnet (not regtest)
+        # ccode_translation=REJECT_NONSTANDARD
+        rawtx: bytes = bytes.fromhex(
+            "020000000217de77d1421d6a6fff4a752524a9b810de8f407a8d833ed7b58f9843efe25853000000006b483045022100ed004a135f1ba01cf163beaff04662fc821581ac8ffeb3e1852e5ebdea82ab5d022052f0c8281c7f934d36667ba0770762228708d6b7e0bcd5463a777276080b9728412103f81d6e9176b7dfe9e86728d3b721ffd5ab9bdb9327be80b6824b8fd35cad96e3feffffff62f233fd8668e4722244279ccc1c94dc809f3cedca7e384795f7ba7e1f69e3df010000006b4830450221008e65c2867f7f4e5675242ba00eaaf98d21b338932c5574568f37b68ec438a82302205c1269ba81e53ea9f3755935e40813c62c9eaeb312888dd9b4b9f1a97d443198412103623a72e6962ccdd1e0793f87ca0af381e190a8857753b4c0cd3641160c5af2acfeffffff0350da1100000000001976a9149fe7cf03a32c8aa2dd684cb6ac697dc6495c6a7d88ac17131900000000001976a9142aa576137000b3e6e1ecb319657663df1a24982588acc0354e02000000001976a91400327f03b93172a7df917639cc5fb3e01822e93d88ac9c3b1800")
+        result: BroadcastResult = await client_manager.broadcast_transaction_and_listen(rawtx,
+            broadcast_peer_count=1)
+        assert result.rejected is not None
+        assert result.rejected.message == 'tx'
+        assert result.rejected.ccode_translation == "REJECT_NONSTANDARD"
+        assert result.rejected.reason == 'bad-txns-nonfinal'
+        assert result.rejected.item_hash == '8db807bb36ca4671b48f353a4f3d9e117ed9c1c3ae76e8c0996f03fb04d6a886'
+
+
+@pytest.mark.asyncio
+async def test_header_acquisition() -> None:
+    # There a quirk with the p2p network where a node will only respond with a rejection
+    # on the first time for the current block. On subsequent broadcasts there will be
+    # radio silence which can be misinterpreted as implicit acceptance
+    # I want this example to behave as expected, so I mine a new regtest block each time.
+    call_any('generate', 1)
+    logging.basicConfig(format="%(asctime)-25s %(levelname)-10s %(name)-28s %(message)s")
+    logger = logging.getLogger('main')
+    logger.setLevel(logging.DEBUG)
+    message_handler = HandlersDefault(REGTEST)
+    peers_list = ["127.0.0.1:18444", "127.0.0.1:18444", "127.0.0.1:18444"]
+
+    async with BitcoinClientManager(message_handler, peers_list,
+            mode=BitcoinClientMode.SIMPLE) as client_manager:
+
+        client = await client_manager.get_next_available_peer()
+        message = await client.get_headers(
+            hash_count=1,
+            block_locator_hashes=[ZERO_HASH],
+            hash_stop=ZERO_HASH
+        )
+        if message:
+            headers: list[BlockHeader] = client.deserializer.headers(io.BytesIO(message))
+            for header in headers:
+                node_rpc_result = call_any('getblockheader', hash_to_hex_str(header.hash)).json()['result']
+                logger.debug(f"Got header. Hash: {hash_to_hex_str(header.hash)}")
+                assert node_rpc_result['hash'] == hash_to_hex_str(header.hash)

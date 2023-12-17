@@ -1,0 +1,87 @@
+trigger:
+  batch: true
+  branches:
+    include:
+    - master
+    - releases/*
+    - features/*
+  paths:
+    exclude: [ 'README.md' ]
+
+pool:
+  vmImage: ubuntu-latest
+  timeoutInMinutes:
+
+steps:
+- task: UsePythonVersion@0
+  inputs:
+    versionSpec: 3.10
+- script: |
+    set -e
+    python3 -m pip install wheel
+    python3 -m pip install -r contrib/requirements.txt
+    python3 -m pip install -r contrib/requirements-dev.txt
+  displayName: 'Install ConduitDB dependencies'
+- script: |
+    set -e
+    python3 -m pip install -U pylint
+    python3 -m pylint --rcfile ./.pylintrc ./conduit_p2p
+    if [ $? -gt 0 ]
+    then
+      echo "##vso[task.complete result=Failed;]DONE"
+    fi
+  continueOnError: true
+  displayName: 'Pylint'
+
+- script: |
+    set -e
+    error_exit()
+    {
+        echo "Error: $1"
+        echo "##vso[task.complete result=Failed;]DONE"
+        exit 1
+    }
+    python3 -m pip install mypy
+    yes | python3 -m mypy --install-types
+    python3 -m mypy --config-file mypy.ini ./conduit_p2p --python-version 3.10 --namespace-packages --explicit-package-bases || error_exit "mypy failed"
+  continueOnError: true
+  displayName: 'Mypy static analysis'
+
+- script: |
+    set -e
+    pytest tests --verbose
+  timeoutInMinutes: 10
+  continueOnError: false
+  displayName: 'Pytest'
+
+- script: |
+    export DOCKER_GATEWAY_HOST=172.17.0.1
+    docker build -f ./contrib/python_base/Dockerfile . -t python_base_p2p
+    docker build -t node-image -f ./contrib/node/Dockerfile .
+    docker run -d --name node -p 18332:18332 -p 18444:18444 node-image
+    sleep 10
+    python3 ./scripts/import_blocks.py ./contrib/blockchains/blockchain_116_7c9cd2
+    docker logs node
+  timeoutInMinutes: 10
+  continueOnError: true
+  displayName: 'Run dockerized services'
+
+- script: |
+    export PYTHONPATH=.
+    pytest tests_functional --verbose
+    if [ $? -gt 0 ]
+    then
+      docker logs node
+      exit 1
+    fi
+  timeoutInMinutes: 10
+  continueOnError: false
+  displayName: 'Pytest Functional'
+
+- script: |
+    docker kill node
+    docker stop node
+    docker rm node
+  timeoutInMinutes: 10
+  continueOnError: true
+  displayName: 'Docker Down'

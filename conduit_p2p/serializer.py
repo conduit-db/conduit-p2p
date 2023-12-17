@@ -85,7 +85,7 @@ class Serializer:
             send_port: int = 8333,
             version: int = 70016,
             relay: int = 1,
-            user_agent: str = ""
+            user_agent: str = "",
     ) -> bytes:
         version = pack_le_uint32(version)
         services = pack_le_uint64(0)

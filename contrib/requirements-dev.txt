@@ -1,6 +1,6 @@
 pytest
 pytest-timeout
 pytest-asyncio
-electrumsv_node
 pylint
 mypy
+requests

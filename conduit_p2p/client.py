@@ -6,6 +6,7 @@
 
 import array
 import asyncio
+import time
 import typing
 from io import BytesIO
 import math
@@ -14,6 +15,7 @@ from asyncio import StreamReader, StreamWriter, Task, IncompleteReadError
 from typing import Any
 import logging
 
+import bitcoinx
 from bitcoinx import double_sha256, read_varint
 
 from .constants import BLOCK_HEADER_LENGTH
@@ -21,16 +23,16 @@ from .preprocessor import unpack_varint, tx_preprocessor
 from .types import (
     BlockType,
     BlockChunkData,
-    BlockDataMsg,
+    BlockDataMsg, BitcoinClientMode, Reject,
 )
-from .commands import BLOCK, EXTMSG, VERACK, TX, BLOCKTXN
+from .commands import BLOCK, EXTMSG, VERACK
 from .utils import create_task
 
 MODULE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 if typing.TYPE_CHECKING:
     from .handlers import HandlersDefault
-    from .deserializer import MessageHeader
+    from .deserializer import MessageHeader, Inv
 
 
 class GracefulDisconnect(Exception):
@@ -46,18 +48,13 @@ DEFAULT_LARGE_MESSAGE_LIMIT = 32 * 1024 * 1024  # 32MB
 
 class BitcoinClient:
     """
-    Big blocks are blocks larger than size.BUFFER_SIZE and are streamed directly to a
-    temporary file and just need to be os.move'd into the
-    correct final resting place.
-
-    Small blocks are blocks less than or equal to size.BUFFER_SIZE and are better to be
-    concatenated in memory before writing them all to the same file. Otherwise the spinning HDD
-    discs will 'stutter' with too many tiny writes.
+    Big blocks are blocks larger than large_message_limit
+    Small blocks are blocks less than or equal to large_message_limit
     """
 
     HEADER_LENGTH = 24
     EXTENDED_HEADER_LENGTH = 24 + 20
-    MESSAGE_HANDLER_TASK_COUNT = 4  # adds concurrency to message handling
+    MESSAGE_HANDLER_TASK_COUNT = 10  # adds concurrency to message handling
 
     def __init__(
         self,
@@ -70,8 +67,11 @@ class BitcoinClient:
         user_agent: str = "",
         reader: StreamReader | None = None,
         writer: StreamWriter | None = None,
-        large_message_limit: int = DEFAULT_LARGE_MESSAGE_LIMIT
+        large_message_limit: int = DEFAULT_LARGE_MESSAGE_LIMIT,
+        mode: BitcoinClientMode = BitcoinClientMode.SIMPLE,
+        relay_transactions: bool = True
     ) -> None:
+        self.relay_transactions: bool = relay_transactions
         self.id = id
         self.logger = logging.getLogger(f"bitcoin-client(id={self.id})")
         self.logger.setLevel(logging.DEBUG)
@@ -94,10 +94,17 @@ class BitcoinClient:
         self.handshake_complete_event = asyncio.Event()
         self.connected = False
         self.closing = False
+        self.remote_start_height = 0  # not updated after connecting
+
+        self.mode = mode
+        # If BitcoinClientMode.SIMPLE is set then messages are passed to these queues
+        self.headers_queue: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=100)
+        self.inv_queue: asyncio.Queue[list[Inv] | None] = asyncio.Queue(maxsize=100)
+        # On tx broadcast wait for Rejection. Correlation with tx_hash is necessary
+        # to enable concurrent usage of the broadcast_transaction method
+        self.tx_reject_queue_map: dict[bytes, Reject | None] = {}  # tx_hash -> Reject
 
         self.tasks: list[Task[Any]] = []
-        # TODO(prioritisation): Track the chain tip of each peer and the time last connected. Ideally would also have
-        #  more sophisticated metrics on things like ping_ms and download rate during a large block download.
 
     async def __aenter__(self) -> 'BitcoinClient':
         await self.connect()
@@ -184,16 +191,17 @@ class BitcoinClient:
 
     async def wait_for_connection(self) -> None:
         """Keep retrying until the node comes online"""
+        # TODO exponential backoff
         while True:
             try:
                 await self.connect()
                 return
             except ConnectionRefusedError:
                 self.logger.debug(
-                    f"Bitcoin node on:  {self.remote_host}:{self.remote_port} currently unavailable "
-                    f"- waiting..."
+                    f"Bitcoin node on:  {self.remote_host}:{self.remote_port} unavailable. "
+                    f"Waiting."
                 )
-                await asyncio.sleep(5)
+                await asyncio.sleep(30)
 
     def send_message(self, message: bytes) -> None:
         assert self.writer is not None
@@ -215,7 +223,7 @@ class BitcoinClient:
                 except asyncio.CancelledError:
                     pass
                 except Exception:
-                    import pdb; pdb.set_trace()  # fmt: skip
+                    self.logger.exception("Unexpected exception in close")
 
     async def handle_message_task_async(self) -> None:
         while True:
@@ -345,7 +353,8 @@ class BitcoinClient:
             recv_port=self.remote_port,
             send_host=local_host,
             send_port=local_port,
-            user_agent=self.user_agent
+            user_agent=self.user_agent,
+            relay=int(self.relay_transactions)
         )
         self.send_message(message)
 
@@ -373,12 +382,77 @@ class BitcoinClient:
             self.send_message(ping_msg)
             await asyncio.sleep(2 * 60)  # Matches bitcoin-sv/net/net.h constant PING_INTERVAL
 
-    def broadcast_transaction(self, rawtx: bytes) -> None:
-        message = self.serializer.tx(rawtx)
-        self.send_message(message)
-
     async def listen(self) -> None:
         """Should periodically check for disconnection and try to reconnect on a sensible
         time schedule (frequently at first) and then less frequently."""
         while not self.closing:
             await asyncio.sleep(2)
+
+    # Specialized methods for sending messages
+    async def broadcast_transaction(self, rawtx: bytes, wait_time: float=10.0,
+            check_malformed: bool = True) -> Reject | None:
+        """This method is part of the BitcoinClientMode.SIMPLE API for apps that care more
+        about a user-friendly API than raw performance.
+
+        If the transaction is rejected by network rules it will immediately return a Reject
+        message with the reason.
+        If the transaction is not rejected then it will return None.
+
+        The BitcoinClientManager has a wrapper around this function which will additionally
+        listen to other peers for evidence that the transaction is being relayed around the
+        network.
+        """
+        if self.mode != BitcoinClientMode.SIMPLE:
+            raise ValueError("This helper method is only available in BitcoinClientMode.SIMPLE mode")
+
+        tx_hash = double_sha256(rawtx)
+        if tx_hash in self.tx_reject_queue_map:
+            raise ValueError("This transaction was already broadcast to this peer")
+
+        try:
+            # Re-parsing the transaction here is inefficient but the REJECT_MALFORMED
+            # message doesn't contain an item_hash so cannot be inserted into the
+            # tx_reject_queue_map from the handler.
+            # If concurrent transaction broadcasts are happening there would be no way
+            # of knowing which transaction was the problematic one
+            # If you're 100% sure you are not producing malformed transactions this
+            # check can be skipped for performance reasons with check_malformed.
+            # In most cases it will not be noticeable. Bitcoinx parses transactions
+            # at a rate of around 50,000 per second.
+            if check_malformed:
+                bitcoinx.Tx.from_bytes(rawtx)
+        except Exception:
+            reject_msg: Reject | None = Reject(message='tx', ccode_translation='REJECT_MALFORMED',
+                reason='error parsing message', item_hash='')
+            return reject_msg
+
+        # Broadcast
+        try:
+            self.tx_reject_queue_map[tx_hash] = None
+            message = self.serializer.tx(rawtx)
+            self.send_message(message)
+
+            # Listen for rejection
+            time_start = time.time()
+            while (time.time() - time_start) < wait_time:
+                reject_msg = self.tx_reject_queue_map[tx_hash]
+                if reject_msg is not None:
+                    return reject_msg
+                await asyncio.sleep(0.2)
+            return None
+        finally:
+            del self.tx_reject_queue_map[tx_hash]
+
+    async def get_headers(self, hash_count: int, block_locator_hashes: list[bytes],
+            hash_stop: bytes) -> bytes | None:
+        if not self.mode:
+            raise ValueError("This helper method is only available in BitcoinClientMode.SIMPLE mode")
+
+        message = self.serializer.getheaders(
+            hash_count=hash_count,
+            block_locator_hashes=block_locator_hashes,
+            hash_stop=hash_stop
+        )
+        self.send_message(message)
+        headers = await self.headers_queue.get()
+        return headers

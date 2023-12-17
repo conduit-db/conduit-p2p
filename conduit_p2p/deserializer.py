@@ -21,14 +21,14 @@ from bitcoinx import (
     read_le_uint16,
     unpack_header,
     Tx,
-    read_be_uint16,
+    read_be_uint16, double_sha256,
 )
 
 from .constants import CCODES
 from .networks import NetworkConfig
 from io import BytesIO
 
-from .types import InvType
+from .types import InvType, BlockHeader, Reject
 
 logger = logging.getLogger("deserializer")
 
@@ -93,13 +93,6 @@ class BlockLocator(NamedTuple):
     version: int
     block_locator_hashes: list[Hash256]
     hash_stop: Hash256
-
-
-class Reject(NamedTuple):
-    message: str
-    ccode_translation: str
-    reason: str
-    item_hash: str
 
 
 class Deserializer:
@@ -213,13 +206,15 @@ class Deserializer:
             inv_vector.append(inv)
         return inv_vector
 
-    def headers(self, f: BytesIO) -> list[Header]:
+    def headers(self, f: BytesIO) -> list[BlockHeader]:
         count = read_varint(f.read)
         headers = []
         for i in range(count):
             raw_header = f.read(80)
             _tx_count = read_varint(f.read)
-            headers.append(unpack_header(raw_header))
+            version, prev_block, merkle_root, timestamp, bits, nonce = unpack_header(raw_header)
+            hash = double_sha256(raw_header)
+            headers.append(BlockHeader(version, prev_block, merkle_root, timestamp, bits, nonce, raw_header, hash))
         return headers
 
     def getdata(self, f: BytesIO) -> list[Inv]:

@@ -47,20 +47,98 @@ ConduitP2P is available on PyPI & supports python versions 3.9+:
 $ python -m pip install conduit-p2p
 ```
 
-### Multiple Peers (Recommended)
-It's possible to create multiple connections to the same node for concurrency or connect to multiple 
-geographically dispersed peers. 
+### Simplified API (for SPV wallets / apps)
+The simplified API (i.e. `mode=BitcoinClientMode.SIMPLE`) uses 
+internal queues which redirects messages from the handlers.
 
-The API is almost identical as for a single peer connection.
+It also unlocks the usage of helper functions:
 
-If you call `client_manager.get_next_peer()` in a loop before each request it will round-robin load balance evenly
-across all peers. How you select peers is entirely up to you.
+- `BitcoinClient.broadcast_transaction`
+- `BitcoinClient.get_headers`
+
+For basic use cases this is acceptable and allows us
+to approximate a request/response pattern. 
+
+For more advanced applications like blockchain indexers you will likely need to use the "Advanced" API 
+where you over-ride some or all of the `HandlersDefault`handlers. Although even then, it may not
+necessarily be required.
+
 ```python
 import asyncio
-import io
+from io import BytesIO
 import logging
-from conduit_p2p import BitcoinClient, BitcoinClientManager, REGTEST, HandlersDefault
 
+from bitcoinx import hash_to_hex_str
+
+from conduit_p2p import BitcoinClientManager, REGTEST, HandlersDefault
+from conduit_p2p.constants import ZERO_HASH
+from conduit_p2p.types import BlockHeader, BitcoinClientMode, BroadcastResult
+
+logging.basicConfig(format="%(asctime)-25s %(levelname)-10s %(name)-28s %(message)s")
+
+async def main():
+    logger = logging.getLogger('main')
+    logger.setLevel(logging.DEBUG)
+    message_handler = HandlersDefault(REGTEST)
+    peers_list = ["127.0.0.1:18444", "127.0.0.1:18444", "127.0.0.1:18444"]
+
+    async with BitcoinClientManager(message_handler, peers_list,
+            mode=BitcoinClientMode.SIMPLE) as client_manager:
+
+        # ccode_translation=REJECT_MALFORMED
+        rawtx: bytes = b"raw transaction goes here"
+        result: BroadcastResult = await client_manager.broadcast_transaction_and_listen(rawtx,
+            broadcast_peer_count=1)
+        if result.rejected is not None:
+            logger.error(f"Transaction rejected. Reason: {result.rejected}")
+
+        client = await client_manager.get_next_available_peer()
+        
+        # Get up to the first 2000 headers
+        message = await client.get_headers(
+            hash_count=1,
+            block_locator_hashes=[ZERO_HASH],
+            hash_stop=ZERO_HASH
+        )
+        if message:
+            headers: list[BlockHeader] = client.deserializer.headers(BytesIO(message))
+            for header in headers:
+                logger.debug(f"Got header. Hash: {hash_to_hex_str(header.hash)}")
+
+        # See the examples/ folder for a fuller demonstration of acquiring all headers
+
+        logger.debug(f"Waiting for the new chain tip")
+        while True:
+            inv_vect = await client.inv_queue.get()
+            logger.debug(f"Got inv_vect: {inv_vect}")  # <- reconcile and maybe send getheaders
+
+asyncio.run(main())
+
+```
+
+### Advanced API
+The advanced API (i.e. `mode=BitcoinClientMode.ADVANCED`) turns off
+any "magic" helper functionality and expects you to over-ride the
+relevant default handlers for your use case.
+
+These functions will raise a ValueError if you try to use them:
+
+- BitcoinClient.broadcast_transaction
+- BitcoinClient.get_headers
+
+Instead, every message type follows the same low-level pattern of
+serializing & then sending.
+
+```python
+import asyncio
+from io import BytesIO
+import logging
+
+from bitcoinx import hash_to_hex_str
+
+from conduit_p2p import BitcoinClient, REGTEST, HandlersDefault, BitcoinClientManager, BitcoinClientMode
+from conduit_p2p.constants import ZERO_HASH
+from conduit_p2p.types import BlockHeader
 
 logging.basicConfig(format="%(asctime)-25s %(levelname)-10s %(name)-28s %(message)s")
 
@@ -69,104 +147,44 @@ class SPVApplicationHandlers(HandlersDefault):
     """Override the other callbacks as you need to."""
 
     def __init__(self, network_type: str):
-        super().__init__(network_type=network_type)
-        self.logger = logging.getLogger("conduit-p2p-handlers")
+        super().__init__(network_type)
         self.logger.setLevel(logging.DEBUG)  # To silence the logs from the default handlers, set a higher level
 
     async def on_headers(self, message: bytes, peer: BitcoinClient) -> None:
-        headers = self.deserializer.headers(io.BytesIO(message))
-        self.logger.debug(f"Received headers (peer_id={peer.id})")
-        for header in headers:
-            self.logger.debug(f"header: {header}")
-
-        await self.client_manager.close()  # <-- This will exit the listening loop and close all connections gracefully
-        # await peer.close()  # <-- Alternatively this would do the same for a single peer
+        if message[0:1] != b"\x00":  # Count of headers was zero
+            headers: list[BlockHeader] = peer.deserializer.headers(BytesIO(message))
+            for header in headers:
+                self.logger.debug(f"Got header. Hash: {hash_to_hex_str(header.hash)}")
 
     async def on_inv(self, message: bytes, peer: BitcoinClient) -> None:
-        inv_vect = self.deserializer.inv(io.BytesIO(message))
+        inv_vect = peer.deserializer.inv(BytesIO(message))
         self.logger.debug("Received inv: %s (peer_id=%s)", inv_vect, peer.id)
 
     async def on_reject(self, message: bytes, peer: BitcoinClient) -> None:
-        reject_msg = self.deserializer.reject(io.BytesIO(message))
+        reject_msg = peer.deserializer.reject(BytesIO(message))
         self.logger.debug("Received reject: %s (peer_id=%s)", reject_msg, peer.id)
 
 
 async def main():
     message_handler = SPVApplicationHandlers(REGTEST)
     peers_list = ["127.0.0.1:18444", "127.0.0.1:18444", "127.0.0.1:18444"]
-
-    async with BitcoinClientManager(message_handler, peers_list) as client_manager:
+    async with BitcoinClientManager(message_handler, peers_list, mode=BitcoinClientMode.ADVANCED) as client_manager:
         rawtx: bytes = b"raw transaction goes here"
-        for _ in range(len(client_manager.clients)):
-            client = client_manager.get_next_peer()
-            client.broadcast_transaction(rawtx)
-
-        message = client.serializer.getheaders(
-            hash_count=1,
-            block_locator_hashes=[bytes.fromhex("0000000000000000000000000000000000000000000000000000000000000000")],
-            hash_stop=bytes.fromhex("0000000000000000000000000000000000000000000000000000000000000000")
-        )
+        client = await client_manager.get_next_available_peer()
+        message = client.serializer.tx(rawtx)
         client.send_message(message)
-        # blocks until `await client_manager.close()` is called above in the `on_headers` handler
-        # You could also enter an app main loop or wait for an event from the handler
-        await client_manager.listen()
 
-asyncio.run(main())
-
-```
-
-### Single Peer
-If you only want to connect to as single peer, you can do it like this.
-```python
-    async def main():
-        message_handler = SPVApplicationHandlers(REGTEST)
-        rawtx: bytes = b"raw transaction goes here"
-
-        async with BitcoinClient(1, remote_host="127.0.0.1", remote_port=18444, message_handler=message_handler) as client:
-            client.broadcast_transaction(rawtx)
-    
-            message = client.serializer.getheaders(
-                hash_count=1,
-                block_locator_hashes=[bytes.fromhex("0000000000000000000000000000000000000000000000000000000000000000")],
-                hash_stop=bytes.fromhex("0000000000000000000000000000000000000000000000000000000000000000")
-            )
-            client.send_message(message)
-            # blocks until `await peer.close()` is called above in the `on_headers` handler
-            # You could also enter an app main loop or wait for an event from your handler
-            await client.listen()
-
-    asyncio.run(main())
-
-```
-
-The most important handlers for a lightweight SPV client might include only:
-
-- `on_headers`
-- `on_reject`
-- `on_inv`
-
-An indexer might require these additional handlers:
-
-- `on_tx`
-- `on_block`        # discussed more below
-- `on_block_chunk`  # discussed more below
-
-You don't need to use `BitcoinClient` or `BitcoinClientManager` with the context manager API. 
-You can also use it like this:
-
-```python
-    async def main():
-        message_handler = SPVApplicationHandlers(REGTEST)
-        client = BitcoinClient(1, remote_host="127.0.0.1", remote_port=18444, message_handler=message_handler)
-        await client.connect()
         message = client.serializer.getheaders(
             hash_count=1,
-            block_locator_hashes=[bytes.fromhex("0000000000000000000000000000000000000000000000000000000000000000")],
-            hash_stop=bytes.fromhex("0000000000000000000000000000000000000000000000000000000000000000")
+            block_locator_hashes=[ZERO_HASH],
+            hash_stop=ZERO_HASH
         )
         client.send_message(message)
         await client.listen()
-        # Do something else after having received the headers
+
+asyncio.run(main())
+
+
 ```
 
 # Specialized Block Handling
