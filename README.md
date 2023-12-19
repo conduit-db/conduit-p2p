@@ -224,6 +224,13 @@ These functions will raise a ValueError if you try to use them in
 In low-level mode, every message type follows the same pattern of
 serializing the message & then sending.
 
+NOTE: It's possible to do both at the same time by using HIGH_LEVEL mode
+and calling `super().on_inv()`, `super().on_reject()` etc. at the start 
+of every handler. There's some overhead to using HIGH_LEVEL mode where
+some things would be deserialized twice and passed to queues before your
+implementation sees the data but depending on your application, it might
+be negligible.
+
 ```python
 import asyncio
 from io import BytesIO
