@@ -30,3 +30,9 @@ block593161.hex
 block593161.offsets
 /tests/data/
 /.pytest_cache/
+examples/headers.mainnet
+examples/headers.regtest
+examples/headers.testnet
+examples/peers.mainnet.json
+examples/peers.testnet.json
+/examples/peers.regtest.json

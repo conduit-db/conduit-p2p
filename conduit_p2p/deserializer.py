@@ -18,10 +18,10 @@ from bitcoinx import (
     read_varbytes,
     read_le_uint32,
     read_varint,
-    read_le_uint16,
     unpack_header,
+    read_be_uint16,
+    double_sha256,
     Tx,
-    read_be_uint16, double_sha256,
 )
 
 from .constants import CCODES
@@ -30,7 +30,7 @@ from io import BytesIO
 
 from .types import InvType, BlockHeader, Reject
 
-logger = logging.getLogger("deserializer")
+logger = logging.getLogger("conduit.p2p.deserializer")
 
 
 Hash256 = bytes
@@ -170,7 +170,7 @@ class Deserializer:
             services = read_le_uint64(f.read)
             reserved = f.read(12)  # IPv6
             ipv4 = socket.inet_ntoa(f.read(4))
-            port = read_le_uint16(f.read)
+            port = read_be_uint16(f.read)
             addresses.append(
                 NodeAddrListItem(
                     timestamp=timestamp,

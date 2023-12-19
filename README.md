@@ -47,87 +47,182 @@ ConduitP2P is available on PyPI & supports python versions 3.9+:
 $ python -m pip install conduit-p2p
 ```
 
-### Simplified API (for SPV wallets / apps)
-The simplified API (i.e. `mode=BitcoinClientMode.SIMPLE`) uses 
-internal queues which redirects messages from the handlers.
+## High level API
+The high level API (i.e. `mode=BitcoinClientMode.HIGH_LEVEL`) uses 
+internal queues which redirect messages from the handlers.
+This is able to give a request/response 'feel' in many ways.
 
 It also unlocks the usage of helper functions:
 
-- `BitcoinClient.broadcast_transaction`
-- `BitcoinClient.get_headers`
+- `BitcoinClient.broadcast_transaction`  # Returns rejections
+- `BitcoinClientManager.broadcast_transaction_and_listen`  # Returns rejections AND peer ids relaying the tx back
+- `BitcoinClient.get_headers`  # Returns a p2p message format header message for deserializing
 
-For basic use cases this is acceptable and allows us
-to approximate a request/response pattern. 
+### Example: Reorg-aware headers acquisition & persistence (& peer info persistence).
+This is the most "high-level" of abstraction example because it uses two heavy-weight,
+opt-in features:
+- The thread-safe & reorg-aware headers store
+- Peer info persistence to .json file
 
-For more advanced applications like blockchain indexers you will likely need to use the "Advanced" API 
-where you over-ride some or all of the `HandlersDefault`handlers. Although even then, it may not
-necessarily be required.
+The persistent headers store will detect reorgs when connecting to the new chain tip. 
+If you're writing a chain indexer it is critical to be aware of reorg events to ensure 
+the state of your database and mempool remains correct at all times.
+
+This example below will:
+    1) Connect to multiple peers for the preferred network
+    2) Will read peers from the peers.<network>.json file and persist new peers not found 
+       there yet. Will skip connecting to peers marked as `banned=true` in the .json file.
+    3) Will get the next available peer (i.e. completed handshake and is ready to accept 
+       getdata or getheaders messages)
+    4) Will synchronize and persist all headers from the remote peer and then stay
+       synchronized with the chain tip by waiting for new `inv` messages.
+    NOTE: `relay_transactions=False` means that mempool transactions will not be relayed
+    via `inv` messages. It's a good idea to do this to filter out mempool network chatter 
+    if you are only wanting headers or raw blocks.
 
 ```python
 import asyncio
 from io import BytesIO
 import logging
 
-from bitcoinx import hash_to_hex_str
-
-from conduit_p2p import BitcoinClientManager, REGTEST, HandlersDefault
-from conduit_p2p.constants import ZERO_HASH
-from conduit_p2p.types import BlockHeader, BitcoinClientMode, BroadcastResult
+from conduit_p2p import BitcoinClientManager, HandlersDefault
+from conduit_p2p.client import get_max_headers, wait_for_new_tip_reorg_aware
+from conduit_p2p.constants import TESTNET, REGTEST, MAINNET
+from conduit_p2p.headers import HeadersStore
+from conduit_p2p.types import BitcoinClientMode
 
 logging.basicConfig(format="%(asctime)-25s %(levelname)-10s %(name)-28s %(message)s")
+logger = logging.getLogger("conduit.p2p.headers.example")
+logger.setLevel(logging.DEBUG)
+
+
+peers = {
+    TESTNET: ["136.243.78.45:18333", "142.132.159.187:18333", "128.199.40.30:18333"],
+    REGTEST: ["127.0.0.1:18444", "127.0.0.1:18444", "127.0.0.1:18444"],
+    MAINNET: ["13.57.104.213:8333", "18.182.32.193:8333", "18.197.105.221:8333", "125.236.230.82:8333"]
+}
+
+
+async def main():
+    network = TESTNET
+    headers_store = HeadersStore(f"headers.{network}", network)
+
+    # Connect to testnet peers and download all headers to chain tip
+    message_handler = HandlersDefault(network)
+    peers_list = peers[network]
+
+    # If there is no intention to listen to the mempool, set relay_transactions=False
+    async with BitcoinClientManager(message_handler, peers_list,
+            mode=BitcoinClientMode.HIGH_LEVEL, relay_transactions=False,
+            use_persisted_peers=True, start_height=headers_store.tip().height) as client_manager:
+        client = await client_manager.get_next_available_peer()
+
+        while headers_store.tip().height < client.remote_start_height:
+            message = await get_max_headers(client, headers_store)
+            if message:
+                headers_store.connect_headers(BytesIO(message))
+                logger.info(f"New headers tip height: {headers_store.tip().height} "
+                            f"(peer={client.id})")
+            else:
+                logger.debug(f"No headers returned (peer_id={client.id})")
+
+        logger.info(f"Finished initial headers download. Waiting for new chain tip")
+        async for new_tip in wait_for_new_tip_reorg_aware(client, headers_store):
+            if not new_tip.is_reorg:
+                logger.info(f"New headers tip height: %s (peer={client.id})", new_tip.stop_header.height)
+            else:
+                logger.debug(f"Reorg detected. Common parent height: {new_tip.reorg_info.commmon_height}. "
+                             f"Old tip:{new_tip.reorg_info.old_tip}. "
+                             f"New tip: {new_tip.reorg_info.new_tip}")
+
+try:
+    asyncio.run(main())
+except KeyboardInterrupt:
+    logger.debug(f"Program stopped")
+```
+
+### High level transaction broadcast & headers acquisition
+This is the high level API without any headers or peer persistence which are both opt-in features.
+
+The high-level `broadcast_transaction_and_listen` helper function used here will broadcast to a
+single peer and listen for `inv` notifications from the other peers.
+
+`concurrency=3` will open 3 connections per peer in the peers_list below. This is mostly only
+useful for chain indexing functions where you want to add concurrency to getdata requests for 
+blocks or transactions to overcome latency effects over a high-ping connection. It probably
+doesn't add much for transaction broadcast unless you're doing high volumes (i.e. >1000txs/sec).
+
+```python
 
 async def main():
     logger = logging.getLogger('main')
     logger.setLevel(logging.DEBUG)
     message_handler = HandlersDefault(REGTEST)
-    peers_list = ["127.0.0.1:18444", "127.0.0.1:18444", "127.0.0.1:18444"]
+    peers_list = ["127.0.0.1:18444"]
 
     async with BitcoinClientManager(message_handler, peers_list,
-            mode=BitcoinClientMode.SIMPLE) as client_manager:
+            mode=BitcoinClientMode.HIGH_LEVEL, concurrency=3) as client_manager:
 
-        # ccode_translation=REJECT_MALFORMED
+        # REJECT_MALFORMED
         rawtx: bytes = b"raw transaction goes here"
         result: BroadcastResult = await client_manager.broadcast_transaction_and_listen(rawtx,
             broadcast_peer_count=1)
         if result.rejected is not None:
             logger.error(f"Transaction rejected. Reason: {result.rejected}")
+        else:
+            logger.error(f"Transaction accepted. Relaying peer_ids: {result.relaying_peer_ids}")
 
+        # REJECT_NONSTANDARD
+        rawtx: bytes = bytes.fromhex("020000000217de77d1421d6a6fff4a752524a9b810de8f407a8d833ed7b58f9843efe25853000000006b483045022100ed004a135f1ba01cf163beaff04662fc821581ac8ffeb3e1852e5ebdea82ab5d022052f0c8281c7f934d36667ba0770762228708d6b7e0bcd5463a777276080b9728412103f81d6e9176b7dfe9e86728d3b721ffd5ab9bdb9327be80b6824b8fd35cad96e3feffffff62f233fd8668e4722244279ccc1c94dc809f3cedca7e384795f7ba7e1f69e3df010000006b4830450221008e65c2867f7f4e5675242ba00eaaf98d21b338932c5574568f37b68ec438a82302205c1269ba81e53ea9f3755935e40813c62c9eaeb312888dd9b4b9f1a97d443198412103623a72e6962ccdd1e0793f87ca0af381e190a8857753b4c0cd3641160c5af2acfeffffff0350da1100000000001976a9149fe7cf03a32c8aa2dd684cb6ac697dc6495c6a7d88ac17131900000000001976a9142aa576137000b3e6e1ecb319657663df1a24982588acc0354e02000000001976a91400327f03b93172a7df917639cc5fb3e01822e93d88ac9c3b1800")
+        result: BroadcastResult = await client_manager.broadcast_transaction_and_listen(rawtx,
+            broadcast_peer_count=1)
+        if result.rejected is not None:
+            logger.error(f"Transaction rejected. Reason: {result.rejected}")
+        else:
+            logger.error(f"Transaction accepted. Relaying peer_ids: {result.relaying_peer_ids}")
+
+        # This get_headers method requires use_headers_queue=True
         client = await client_manager.get_next_available_peer()
-        
-        # Get up to the first 2000 headers
         message = await client.get_headers(
             hash_count=1,
             block_locator_hashes=[ZERO_HASH],
             hash_stop=ZERO_HASH
         )
-        if message:
-            headers: list[BlockHeader] = client.deserializer.headers(BytesIO(message))
-            for header in headers:
-                logger.debug(f"Got header. Hash: {hash_to_hex_str(header.hash)}")
-
-        # See the examples/ folder for a fuller demonstration of acquiring all headers
+        headers = client.deserializer.headers(BytesIO(message))
+        for header in headers:
+            logger.debug(f"Got header. Hash: {hash_to_hex_str(header.hash)}")
 
         logger.debug(f"Waiting for the new chain tip")
         while True:
-            inv_vect = await client.inv_queue.get()
-            logger.debug(f"Got inv_vect: {inv_vect}")  # <- reconcile and maybe send getheaders
+            inv_vect = await client.inv_queue_blocks.get()
+            logger.debug(f"Got inv_vect: {inv_vect}")
 
 asyncio.run(main())
-
 ```
 
-### Advanced API
-The advanced API (i.e. `mode=BitcoinClientMode.ADVANCED`) turns off
+
+### Low-level API
+The advanced API (i.e. `mode=BitcoinClientMode.LOW_LEVEL`) turns off
 any "magic" helper functionality and expects you to over-ride the
-relevant default handlers for your use case.
+relevant default handlers for your use case. Basically all the
+default handlers except for the essential ones for completing the initial
+connection handshake (version, verack) and staying connected (ping, pong) 
+will just deserialize the message and log to console that they received it.
 
-These functions will raise a ValueError if you try to use them:
+To get anything useful done, you'll need to override the handlers and write
+your own custom business logic. However, the BitcoinClientMode.HIGH_LEVEL 
+code in each default handler might serve as a template for your own 
+implementation.
 
-- BitcoinClient.broadcast_transaction
-- BitcoinClient.get_headers
+These functions will raise a ValueError if you try to use them in 
+`mode=BitcoinClientMode.LOW_LEVEL`:
 
-Instead, every message type follows the same low-level pattern of
-serializing & then sending.
+- `BitcoinClient.broadcast_transaction`
+- `BitcoinClientManager.broadcast_transaction_and_listen`
+- `BitcoinClient.get_headers`
+
+In low-level mode, every message type follows the same pattern of
+serializing the message & then sending.
 
 ```python
 import asyncio
@@ -144,11 +239,12 @@ logging.basicConfig(format="%(asctime)-25s %(levelname)-10s %(name)-28s %(messag
 
 
 class SPVApplicationHandlers(HandlersDefault):
-    """Override the other callbacks as you need to."""
+    """Override the other callbacks as you need to"""
 
-    def __init__(self, network_type: str):
+    def __init__(self, network_type: str, app_state: dict[Any, Any]):
         super().__init__(network_type)
         self.logger.setLevel(logging.DEBUG)  # To silence the logs from the default handlers, set a higher level
+        self.app_state = app_state
 
     async def on_headers(self, message: bytes, peer: BitcoinClient) -> None:
         if message[0:1] != b"\x00":  # Count of headers was zero
@@ -166,9 +262,10 @@ class SPVApplicationHandlers(HandlersDefault):
 
 
 async def main():
-    message_handler = SPVApplicationHandlers(REGTEST)
+    app_state = {}
+    message_handler = SPVApplicationHandlers(REGTEST, app_state)
     peers_list = ["127.0.0.1:18444", "127.0.0.1:18444", "127.0.0.1:18444"]
-    async with BitcoinClientManager(message_handler, peers_list, mode=BitcoinClientMode.ADVANCED) as client_manager:
+    async with BitcoinClientManager(message_handler, peers_list, mode=BitcoinClientMode.LOW_LEVEL) as client_manager:
         rawtx: bytes = b"raw transaction goes here"
         client = await client_manager.get_next_available_peer()
         message = client.serializer.tx(rawtx)
@@ -181,6 +278,7 @@ async def main():
         )
         client.send_message(message)
         await client.listen()
+
 
 asyncio.run(main())
 

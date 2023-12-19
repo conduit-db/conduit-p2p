@@ -28,7 +28,7 @@ from .constants import (
 
 MODULE_DIR = Path(os.path.dirname(os.path.abspath(__file__)))
 
-logger = logging.getLogger("conduit-lib-utils")
+logger = logging.getLogger("conduit.p2p.utils")
 logger.setLevel(logging.DEBUG)
 
 

@@ -9,7 +9,7 @@ import logging
 import requests
 
 
-logger = logging.getLogger("call-node-rpc")
+logger = logging.getLogger("conduit.p2p.conftest")
 
 
 def call_any(method_name: str, *args, rpcport: int=18332, rpchost: str="127.0.0.1", rpcuser:

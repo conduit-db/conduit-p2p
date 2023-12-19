@@ -85,8 +85,8 @@ class BlockHeader(NamedTuple):
 
 
 class BitcoinClientMode(IntEnum):
-    SIMPLE = 1
-    ADVANCED = 2
+    HIGH_LEVEL = 1
+    LOW_LEVEL = 2
 
 
 class Reject(NamedTuple):

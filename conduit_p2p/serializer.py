@@ -22,7 +22,7 @@ from bitcoinx import (
     hex_str_to_hash,
     int_to_be_bytes,
     pack_be_uint16,
-    pack_byte,
+    pack_byte, pack_le_int32,
 )
 
 from .commands import (
@@ -51,7 +51,7 @@ from .utils import (
 )
 from .constants import ZERO_HASH
 
-logger = logging.getLogger("serializer")
+logger = logging.getLogger("conduit.p2p.serializer")
 
 
 class CompactBlockMode(IntEnum):
@@ -86,6 +86,7 @@ class Serializer:
             version: int = 70016,
             relay: int = 1,
             user_agent: str = "",
+            height: int = 0
     ) -> bytes:
         version = pack_le_uint32(version)
         services = pack_le_uint64(0)
@@ -94,7 +95,7 @@ class Serializer:
         addr_sndr = services + ipv4_to_mapped_ipv6(send_host) + pack_be_uint16(send_port)
         nonce = pack_le_uint64(random.getrandbits(64))
         user_agent = pack_varbytes(user_agent.encode())
-        height = pack_le_uint32(0)
+        height = pack_le_int32(height)
         relay = pack_byte(relay)
         payload = version + services + timestamp + addr_recv + addr_sndr + nonce + user_agent + height + relay
         return self.payload_to_message(VERSION_BIN, payload)
