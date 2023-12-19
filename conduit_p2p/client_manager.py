@@ -4,19 +4,33 @@
 #
 # Licensed under the MIT License; see LICENCE for details.
 import asyncio
+import json
 import logging
+import os
+import time
 import typing
+from typing import TypedDict
+from pathlib import Path
 from typing import Iterable
 from random import random
 
-from bitcoinx import double_sha256
+from bitcoinx import double_sha256, hex_str_to_hash
 
 from .client import BitcoinClient, DEFAULT_LARGE_MESSAGE_LIMIT
+from .deserializer import Inv
 from .types import BitcoinClientMode, Reject, BroadcastResult
 from .utils import cast_to_valid_ipv4, create_task
 
 if typing.TYPE_CHECKING:
     from .handlers import HandlersDefault
+
+
+MODULE_DIR = Path(os.path.dirname(os.path.abspath(__file__)))
+
+
+class PeerInfo(TypedDict):
+    last_connected: int | None  # unix timestamp | None for never connected
+    banned: bool
 
 
 class PeerManagerFailedError(Exception):
@@ -30,11 +44,15 @@ class BitcoinClientManager:
 
     def __init__(self, message_handler: 'HandlersDefault', peers_list: list[str],
             large_message_limit: int = DEFAULT_LARGE_MESSAGE_LIMIT,
-            mode: BitcoinClientMode = BitcoinClientMode.SIMPLE,
-            relay_transactions: bool = True
+            mode: BitcoinClientMode = BitcoinClientMode.HIGH_LEVEL,
+            relay_transactions: bool = True,
+            use_persisted_peers: bool = True,
+            start_height: int = 0,
+            concurrency: int = 1,
+            wait_for_n_peers: int = 1
     ) -> None:
         self.closing: bool = False
-        self._logger = logging.getLogger("bitcoin-p2p-client-pool")
+        self._logger = logging.getLogger("conduit.p2p.client.pool")
         self._logger.setLevel(logging.DEBUG)
         self.message_handler = message_handler
         self.message_handler.client_manager = self
@@ -44,22 +62,38 @@ class BitcoinClientManager:
         self.large_message_limit = large_message_limit
         self.clients: list[BitcoinClient] = []
         self.mode = mode
-        for peer_id, host_string in enumerate(peers_list, start=1):
-            host, port = host_string.split(":")
-            host = cast_to_valid_ipv4(host)  # important for dns resolution of docker container IP addresses
-            client = BitcoinClient(id=peer_id, remote_host=host, remote_port=int(port),
-                message_handler=message_handler, mode=mode, relay_transactions=relay_transactions)
-            self.clients.append(client)
+        self.relay_transactions = relay_transactions
+        self.last_added_peer_id = 0
+        self.addresses: dict[str, PeerInfo] = {}
+        self.use_persisted_peers = use_persisted_peers
+        self.start_height = start_height
+        self.concurrency = concurrency
+        self.wait_for_n_peers = wait_for_n_peers
+        self.peers_dir = Path(os.getenv('CONDUIT_P2P_PEERS_DIR', Path(os.getcwd())))
+        self.peers_filepath = self.peers_dir / f'peers.{self.net_config.NET}.json'
+        if use_persisted_peers:
+            self._logger.debug(f"Using peers file at: {self.peers_filepath}")
+            self.addresses = self.read_peers_file()
+            for host_string in peers_list:
+                if host_string not in self.addresses:
+                    self.addresses[host_string] = PeerInfo(last_connected=None, banned=False)
+        else:
+            self.addresses = dict((host_string, PeerInfo(last_connected=None, banned=False))
+                for host_string in peers_list)
 
-        self._connection_pool: list[BitcoinClient] = []
-        self._disconnected_pool: list[BitcoinClient] = []
+        for host_string in self.addresses:
+            self.add_client(host_string)
+
+        self._connection_pool: set[BitcoinClient] = set()
+        self._disconnected_pool: set[BitcoinClient] = set()
         self._currently_selected_peer_index: int = 0
 
         # On tx broadcast, record acceptance by other peers
-        self.tx_inv_queue_map: dict[bytes, list[int]] = {} # tx_hash -> list[BitcoinClient.id]
+        self.tx_inv_queue_map: dict[bytes, list[int]] = {}  # tx_hash -> list[BitcoinClient.id]
+        self.tx_inv_queue: asyncio.Queue[tuple[list[Inv], BitcoinClient]] = asyncio.Queue(maxsize=100)
 
     async def __aenter__(self) -> "BitcoinClientManager":
-        await self.connect_all_peers()
+        await self.connect_all_peers(self.wait_for_n_peers)
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb) -> None:  # type: ignore
@@ -68,8 +102,45 @@ class BitcoinClientManager:
     def __len__(self) -> int:
         return len(self._connection_pool)
 
-    def add_client(self, client: BitcoinClient) -> None:
-        self.clients.append(client)
+    def read_peers_file(self) -> dict[str, PeerInfo]:
+        if not self.peers_filepath.exists():
+            self.peers_dir.mkdir(parents=True, exist_ok=True)
+            self.peers_filepath.touch(exist_ok=True)
+        with open(self.peers_filepath, 'r') as file:
+            content = file.read()
+            if content:
+                self.addresses = json.loads(content)
+            else:
+                self.addresses = {}
+        return self.addresses
+
+    def write_peers_file(self) -> None:
+        """Completely overwrites the file every time. Low-tech solution."""
+        with open(self.peers_filepath, 'w') as file:
+            file.write(json.dumps(self.addresses, indent=4))
+
+    def add_client(self, host_string: str) -> BitcoinClient | None:
+        if host_string not in self.addresses:
+            self.addresses[host_string] = PeerInfo(last_connected=None, banned=False)
+
+        if self.use_persisted_peers:
+            self.write_peers_file()
+
+        peer_info = self.addresses[host_string]
+        if peer_info['banned']:
+            self._logger.info(f"Skipping banned peer at: {host_string}")
+            return None
+
+        host, port = host_string.split(":")
+        host = cast_to_valid_ipv4(host)  # important for dns resolution of docker container IP addresses
+        assert self.concurrency > 0
+        for i in range(self.concurrency):
+            self.last_added_peer_id += 1
+            client = BitcoinClient(id=self.last_added_peer_id, remote_host=host, remote_port=int(port),
+                message_handler=self.message_handler, mode=self.mode,
+                relay_transactions=self.relay_transactions, start_height=self.start_height)
+            self.clients.append(client)
+        return client
 
     def select_next_peer(self) -> None:
         """This will iterate through all clients regardless of whether they are connected or not"""
@@ -78,7 +149,7 @@ class BitcoinClientManager:
         else:
             self._currently_selected_peer_index += 1
 
-    def get_connected_peers(self) -> list[BitcoinClient]:
+    def get_connected_peers(self) -> set[BitcoinClient]:
         return self._connection_pool
 
     def get_next_peer(self) -> BitcoinClient:
@@ -98,35 +169,85 @@ class BitcoinClientManager:
                 await asyncio.sleep(1)  # avoid spinning
         return client
 
+    def _reallocate_outstanding_getdatas(self, client: BitcoinClient) -> None:
+        """This includes headers, txs, blocks"""
+        raise NotImplementedError()
+
     def get_current_peer(self) -> BitcoinClient:
         """This peer might be disconnected. Requires filtering"""
         return self.clients[self._currently_selected_peer_index]
 
-    async def connect_all_peers(self) -> None:
-        """Should have tolerance for some failed connections to offline peers"""
-        async def connect_task() -> None:
+    async def connect_task(self, client: BitcoinClient) -> None:
+        self._disconnected_pool.add(client)
+        sleep_times = [5, 30, 90, 180, 600]  # Sleep 10 minutes for each retry thereafter
+
+        sleep_index = 0
+        while True:
             try:
-                await client.wait_for_connection()
-                self._connection_pool.append(client)
-            except ConnectionResetError:
-                self._logger.error(
-                    f"Failed to connect to peer. host: {client.remote_host}, " f"port: {client.remote_port}"
-                )
-                self._disconnected_pool.append(client)
+                # raise ConnectionResetError if connection doesn't complete handshake
+                await client.connect()
+            except ConnectionResetError:  # < -- disconnected
+                sleep_index = min(sleep_index + 1, len(sleep_times) - 1)
+                self._logger.debug(f"Peer at: {client.remote_host}:{client.remote_port} "
+                                   f"unavailable. Retry in {sleep_times[sleep_index]} seconds.")
+            except (ConnectionRefusedError, OSError):
+                sleep_index = len(sleep_times) - 1
+                self._logger.error(f"Peer at: {client.remote_host}:{client.remote_port} "
+                                   f"Refused connection. Retry in {sleep_times[sleep_index]} seconds.")
+            else:
+                sleep_index = 0
+                self._logger.info(f"Connected to peer: {client.host_string}")
+                self._disconnected_pool.remove(client)
+                self._connection_pool.add(client)
+                self.addresses[client.host_string]['last_connected'] = int(time.time())
+                self.write_peers_file()
+                await client.connection_lost_event.wait()
+                client.connection_lost_event.clear()
+                self._logger.info(f"Peer at: {client.remote_host}:{client.remote_port} disconnected gracefully. "
+                                  f"Retry in {sleep_times[sleep_index]} seconds.")
+
+            # Was connected.
+            if client in self._connection_pool:
+                self._connection_pool.remove(client)
+                # self._reallocate_outstanding_getdatas(client)
+            self._disconnected_pool.add(client)
+
+            await asyncio.sleep(sleep_times[sleep_index])
+            client.reset_state()
+
+    async def connect_client(self, client: BitcoinClient) -> None:
+        create_task(self.connect_task(client))
+
+    async def connect_all_peers(self, wait_for_n_peers: int = 1) -> None:
+        """Should have tolerance for some failed connections to offline peers"""
+        create_task(self.listen_for_tx_relay_task())
 
         for client in self.clients:
-            create_task(connect_task())
-            await asyncio.sleep(random()*2)  # avoid thundering herd on the same node
-        if len(self._connection_pool) == 0:
-            raise PeerManagerFailedError("All connections failed")
+            await self.connect_client(client)
+            await asyncio.sleep(random()*1)  # avoid thundering herd on the same node
+
+        if wait_for_n_peers:
+            waits = 0
+            sleep_time = 1
+            while len(self._connection_pool) < wait_for_n_peers:
+                waits += 1
+                await asyncio.sleep(sleep_time)
+                if waits > 5:
+                    self._logger.info(f"Only {len(self._connection_pool)} of {wait_for_n_peers} connected. Waiting.")
+                    sleep_time = 5
+                    waits = 0
 
     async def close(self) -> None:
         self.closing = True
         # Force close all outstanding connections
-        outstanding_connections = list(self._connection_pool)
-        for peer in outstanding_connections:
-            if peer.connected:
-                await peer.close()
+        # TODO: RuntimeError: Set changed size during iteration
+        peers = []
+        for peer in self._connection_pool:
+            if not peer.closing:
+                peers.append(peer)
+        for peer in peers:
+            await peer.close()
+        await asyncio.sleep(1)
 
     async def listen(self) -> None:
         """Should periodically check for disconnected peers and try to reconnect them on a sensible
@@ -148,9 +269,21 @@ class BitcoinClientManager:
 
         return await asyncio.gather(*tasks, return_exceptions=False)
 
+    async def listen_for_tx_relay_task(self) -> None:
+        """A long-running background task that tracks which peer_ids relayed back to us
+        a tx_hash that we broadcasted (to another peer). This provides tangible feedback that
+        the transaction has propagated to the mempool of other nodes."""
+        # Add peer id to list of `relaying_peer_ids` for the transaction_broadcast
+        while not self.closing:
+            inv_vect_txs, client = await self.tx_inv_queue.get()
+            for inv in inv_vect_txs:
+                tx_hash = hex_str_to_hash(inv['inv_hash'])
+                if tx_hash in self.tx_inv_queue_map:
+                    self.tx_inv_queue_map[tx_hash].append(client.id)
+
     async def broadcast_transaction_and_listen(self, rawtx: bytes, wait_time: float=5.0,
             broadcast_peer_count: int = 1, check_malformed: bool = True) -> BroadcastResult:
-        if self.mode != BitcoinClientMode.SIMPLE:
+        if self.mode != BitcoinClientMode.HIGH_LEVEL:
             raise ValueError("This helper method is only available in BitcoinClientMode.SIMPLE mode")
 
         available_peers_count = len(self.get_connected_peers())

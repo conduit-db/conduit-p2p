@@ -14,7 +14,7 @@ struct_le_H = Struct("<H")
 struct_le_I = Struct("<I")
 struct_le_Q = Struct("<Q")
 
-logger = logging.getLogger("algorithms")
+logger = logging.getLogger("conduit.p2p.algorithms")
 
 
 def unpack_varint(buf: bytes | memoryview, offset: int) -> tuple[int, int]:

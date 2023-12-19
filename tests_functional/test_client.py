@@ -42,7 +42,8 @@ MODULE_DIR = Path(os.path.dirname(os.path.abspath(__file__)))
 os.environ["GENESIS_ACTIVATION_HEIGHT"] = "0"
 os.environ["NETWORK_BUFFER_SIZE"] = "1000000"
 
-logger = logging.getLogger("bitcoin-p2p-socket")
+logging.basicConfig(format="%(asctime)-25s %(levelname)-10s %(name)-28s %(message)s")
+logger = logging.getLogger("conduit.p2p.test.client")
 logger.setLevel(logging.DEBUG)
 
 REGTEST_NODE_HOST = "127.0.0.1"
@@ -263,8 +264,8 @@ async def test_peer_manager():
     try:
         received_message_queue = asyncio.Queue()
         message_handler = MockHandlers(REGTEST, received_message_queue)
-        peers_list = ["127.0.0.1:18444", "127.0.0.1:18444", "127.0.0.1:18444"]
-        peer_manager = BitcoinClientManager(message_handler, peers_list=peers_list)
+        peers_list = ["127.0.0.1:18444"]
+        peer_manager = BitcoinClientManager(message_handler, peers_list=peers_list, concurrency=3)
         await peer_manager.connect_all_peers()
         assert len(peer_manager.get_connected_peers()) == len(peer_manager.clients) == 3
 
@@ -335,7 +336,7 @@ async def test_getblocks_request_and_blocks_response():
             REGTEST_NODE_HOST,
             REGTEST_NODE_PORT,
             message_handler,
-            mode=BitcoinClientMode.ADVANCED
+            mode=BitcoinClientMode.LOW_LEVEL
         )
         await client.connect()
 
@@ -541,19 +542,20 @@ async def test_transaction_broadcast() -> None:
     # radio silence which can be misinterpreted as implicit acceptance
     # I want this example to behave as expected, so I mine a new regtest block each time.
     call_any('generate', 1)
-    logging.basicConfig(format="%(asctime)-25s %(levelname)-10s %(name)-28s %(message)s")
-    logger = logging.getLogger('main')
-    logger.setLevel(logging.DEBUG)
     message_handler = HandlersDefault(REGTEST)
-    peers_list = ["127.0.0.1:18444", "127.0.0.1:18444", "127.0.0.1:18444"]
+    peers_list = ["127.0.0.1:18444"]
 
     async with BitcoinClientManager(message_handler, peers_list,
-            mode=BitcoinClientMode.SIMPLE) as client_manager:
+            mode=BitcoinClientMode.HIGH_LEVEL, concurrency=3) as client_manager:
 
         # ccode_translation=REJECT_MALFORMED
         rawtx: bytes = b"raw transaction goes here"
         result: BroadcastResult = await client_manager.broadcast_transaction_and_listen(rawtx,
             broadcast_peer_count=1)
+        if result.rejected is not None:
+            logger.error(f"Transaction rejected. Reason: {result.rejected}")
+        else:
+            logger.error(f"Transaction accepted. Relaying peer_ids: {result.relaying_peer_ids}")
         assert result.rejected is not None
         assert result.rejected.message == 'tx'
         assert result.rejected.ccode_translation == "REJECT_MALFORMED"
@@ -566,6 +568,10 @@ async def test_transaction_broadcast() -> None:
             "020000000217de77d1421d6a6fff4a752524a9b810de8f407a8d833ed7b58f9843efe25853000000006b483045022100ed004a135f1ba01cf163beaff04662fc821581ac8ffeb3e1852e5ebdea82ab5d022052f0c8281c7f934d36667ba0770762228708d6b7e0bcd5463a777276080b9728412103f81d6e9176b7dfe9e86728d3b721ffd5ab9bdb9327be80b6824b8fd35cad96e3feffffff62f233fd8668e4722244279ccc1c94dc809f3cedca7e384795f7ba7e1f69e3df010000006b4830450221008e65c2867f7f4e5675242ba00eaaf98d21b338932c5574568f37b68ec438a82302205c1269ba81e53ea9f3755935e40813c62c9eaeb312888dd9b4b9f1a97d443198412103623a72e6962ccdd1e0793f87ca0af381e190a8857753b4c0cd3641160c5af2acfeffffff0350da1100000000001976a9149fe7cf03a32c8aa2dd684cb6ac697dc6495c6a7d88ac17131900000000001976a9142aa576137000b3e6e1ecb319657663df1a24982588acc0354e02000000001976a91400327f03b93172a7df917639cc5fb3e01822e93d88ac9c3b1800")
         result: BroadcastResult = await client_manager.broadcast_transaction_and_listen(rawtx,
             broadcast_peer_count=1)
+        if result.rejected is not None:
+            logger.error(f"Transaction rejected. Reason: {result.rejected}")
+        else:
+            logger.error(f"Transaction accepted. Relaying peer_ids: {result.relaying_peer_ids}")
         assert result.rejected is not None
         assert result.rejected.message == 'tx'
         assert result.rejected.ccode_translation == "REJECT_NONSTANDARD"
@@ -580,14 +586,11 @@ async def test_header_acquisition() -> None:
     # radio silence which can be misinterpreted as implicit acceptance
     # I want this example to behave as expected, so I mine a new regtest block each time.
     call_any('generate', 1)
-    logging.basicConfig(format="%(asctime)-25s %(levelname)-10s %(name)-28s %(message)s")
-    logger = logging.getLogger('main')
-    logger.setLevel(logging.DEBUG)
     message_handler = HandlersDefault(REGTEST)
     peers_list = ["127.0.0.1:18444", "127.0.0.1:18444", "127.0.0.1:18444"]
 
     async with BitcoinClientManager(message_handler, peers_list,
-            mode=BitcoinClientMode.SIMPLE) as client_manager:
+            mode=BitcoinClientMode.HIGH_LEVEL) as client_manager:
 
         client = await client_manager.get_next_available_peer()
         message = await client.get_headers(
@@ -595,9 +598,8 @@ async def test_header_acquisition() -> None:
             block_locator_hashes=[ZERO_HASH],
             hash_stop=ZERO_HASH
         )
-        if message:
-            headers: list[BlockHeader] = client.deserializer.headers(io.BytesIO(message))
-            for header in headers:
-                node_rpc_result = call_any('getblockheader', hash_to_hex_str(header.hash)).json()['result']
-                logger.debug(f"Got header. Hash: {hash_to_hex_str(header.hash)}")
-                assert node_rpc_result['hash'] == hash_to_hex_str(header.hash)
+        headers = client.deserializer.headers(io.BytesIO(message))
+        for header in headers:
+            node_rpc_result = call_any('getblockheader', hash_to_hex_str(header.hash)).json()['result']
+            logger.debug(f"Got header. Hash: {hash_to_hex_str(header.hash)}")
+            assert node_rpc_result['hash'] == hash_to_hex_str(header.hash)

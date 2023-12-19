@@ -5,6 +5,13 @@
 # Licensed under the MIT License; see LICENCE for details.
 __version__ = '0.0.1'
 
+__all__ = (
+    'BitcoinClient', 'BitcoinClientManager', 'REGTEST',
+    'MAINNET', 'TESTNET', 'SCALINGTESTNET', 'ZERO_HASH', 'MsgType',
+    'Deserializer', 'HandlersDefault', 'NetworkConfig', 'Serializer',
+    'BitcoinClientMode'
+)
+
 from conduit_p2p.client import BitcoinClient
 from conduit_p2p.client_manager import BitcoinClientManager
 from conduit_p2p.constants import REGTEST, MAINNET, TESTNET, SCALINGTESTNET, ZERO_HASH, MsgType

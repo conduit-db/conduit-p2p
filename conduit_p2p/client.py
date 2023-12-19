@@ -6,33 +6,39 @@
 
 import array
 import asyncio
+import hashlib
 import time
 import typing
 from io import BytesIO
 import math
 import os
 from asyncio import StreamReader, StreamWriter, Task, IncompleteReadError
-from typing import Any
+from typing import Any, AsyncIterable
 import logging
 
 import bitcoinx
-from bitcoinx import double_sha256, read_varint
+from bitcoinx import double_sha256, read_varint, hash_to_hex_str, hex_str_to_hash
 
-from .constants import BLOCK_HEADER_LENGTH
+from .constants import BLOCK_HEADER_LENGTH, ZERO_HASH
 from .preprocessor import unpack_varint, tx_preprocessor
 from .types import (
     BlockType,
     BlockChunkData,
-    BlockDataMsg, BitcoinClientMode, Reject,
+    BlockDataMsg, BitcoinClientMode, Reject, InvType,
 )
 from .commands import BLOCK, EXTMSG, VERACK
+from .deserializer import MessageHeader
 from .utils import create_task
 
 MODULE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 if typing.TYPE_CHECKING:
     from .handlers import HandlersDefault
-    from .deserializer import MessageHeader, Inv
+    from .deserializer import Inv
+    from .headers import HeadersStore, NewTipResult
+
+logger = logging.getLogger(f"conduit.p2p.client")
+logger.setLevel(logging.DEBUG)
 
 
 class GracefulDisconnect(Exception):
@@ -68,15 +74,16 @@ class BitcoinClient:
         reader: StreamReader | None = None,
         writer: StreamWriter | None = None,
         large_message_limit: int = DEFAULT_LARGE_MESSAGE_LIMIT,
-        mode: BitcoinClientMode = BitcoinClientMode.SIMPLE,
-        relay_transactions: bool = True
+        mode: BitcoinClientMode = BitcoinClientMode.HIGH_LEVEL,
+        relay_transactions: bool = True,
+        start_height: int = 0
     ) -> None:
-        self.relay_transactions: bool = relay_transactions
         self.id = id
-        self.logger = logging.getLogger(f"bitcoin-client(id={self.id})")
+        self.logger = logging.getLogger(f"conduit.p2p.client (id={self.id})")
         self.logger.setLevel(logging.DEBUG)
         self.remote_host = remote_host
         self.remote_port = remote_port
+        self.host_string = f"{self.remote_host}:{self.remote_port}"
         self.local_host = local_host
         self.local_port = local_port
         self.user_agent = user_agent
@@ -92,14 +99,16 @@ class BitcoinClient:
 
         self.connection_lost_event = asyncio.Event()
         self.handshake_complete_event = asyncio.Event()
-        self.connected = False
         self.closing = False
         self.remote_start_height = 0  # not updated after connecting
 
         self.mode = mode
+        self.relay_transactions: bool = relay_transactions
+        self.start_height = start_height
+        assert isinstance(self.start_height, int)
         # If BitcoinClientMode.SIMPLE is set then messages are passed to these queues
         self.headers_queue: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=100)
-        self.inv_queue: asyncio.Queue[list[Inv] | None] = asyncio.Queue(maxsize=100)
+        self.inv_queue_blocks: asyncio.Queue[list[Inv]] = asyncio.Queue(maxsize=100)
         # On tx broadcast wait for Rejection. Correlation with tx_hash is necessary
         # to enable concurrent usage of the broadcast_transaction method
         self.tx_reject_queue_map: dict[bytes, Reject | None] = {}  # tx_hash -> Reject
@@ -113,11 +122,76 @@ class BitcoinClient:
     async def __aexit__(self, exc_type, exc_val, exc_tb):  # type: ignore
         await self.close()
 
+    async def read_header(self) -> 'MessageHeader':
+        assert self.reader is not None
+        stream = BytesIO()
+        try:
+            data = await self.reader.readexactly(self.HEADER_LENGTH)
+        except IncompleteReadError:
+            raise ConnectionResetError
+
+        stream.seek(0, os.SEEK_END)
+        stream.write(data)
+
+        assert self.reader is not None
+        stream.seek(0)
+        header: 'MessageHeader' = self.deserializer.deserialize_message_header(stream)
+        if header.magic != f"{self.net_config.MAGIC:x}":
+            raise ValueError("Incorrect network magic: %s", header.magic)
+        if header.command == EXTMSG:
+            if stream.tell() < self.EXTENDED_HEADER_LENGTH:
+                try:
+                    data = await self.reader.readexactly(self.EXTENDED_HEADER_LENGTH - stream.tell())
+                except IncompleteReadError:
+                    raise ConnectionResetError
+                stream.write(data)
+            stream.seek(0)
+            return self.deserializer.deserialize_extended_message_header(stream)
+        return header
+
+    async def read_and_handle_payload(self, header: MessageHeader) -> None:
+        stream = BytesIO()
+        if header.length < self.large_message_limit:
+            payload = await self.read_small_payload(stream, header)
+            if header.command == BLOCK:
+                await self.handle_small_block(payload, header.length)
+            else:
+                await self.message_queue.put((header.command, payload))
+        elif header.command == BLOCK:
+            await self.handle_big_block(stream, header.length, header)
+        else:
+            # tx, cmpctblock, blocktxn, getblocktxn can be large
+            payload = await self.read_small_payload(stream, header)
+            await self.message_queue.put((header.command, payload))
+
+    async def _session(self) -> None:
+        """raises `ConnectionResetError` on disconnect
+           raises `ValueError` on misbehaviour"""
+        assert self.reader is not None
+        for i in range(self.MESSAGE_HANDLER_TASK_COUNT):
+            self.tasks.append(create_task(self.handle_message_task_async()))
+        self.tasks.append(create_task(self.keepalive()))
+        self.tasks.append(create_task(self.handshake(self.local_host, self.local_port, self.start_height)))
+
+        while True:
+            header = await self.read_header()
+            await self.read_and_handle_payload(header)
+
+    async def start_session(self) -> None:
+        """Reconnection logic needs to be managed by the ClientManager"""
+        try:
+            await self._session()
+        except ConnectionResetError:
+            self.logger.error(f"Bitcoin node disconnected")
+        except ValueError as e:
+            self.logger.error(f"Misbehaving node. Reason:{e}. Disconnecting")
+        finally:
+            await self.close()
+
     async def connect(self) -> None:
         """raises `ConnectionResetError`"""
         if self.reader is None and self.writer is None:
             self.reader, self.writer = await asyncio.open_connection(host=self.remote_host, port=self.remote_port)
-        self.connected = True
         self.logger.debug(
             f"Connection made to peer: {self.remote_host}:{self.remote_port} (peer_id={self.id})"
         )
@@ -125,20 +199,8 @@ class BitcoinClient:
         assert self.writer is not None
         self.tasks.append(create_task(self.start_session()))
         await self.handshake_complete_event.wait()
-
-    async def read_header(self, stream: BytesIO) -> 'MessageHeader':
-        assert self.reader is not None
-        header: 'MessageHeader' = self.deserializer.deserialize_message_header(stream)
-        if header.command == EXTMSG:
-            if stream.tell() < self.EXTENDED_HEADER_LENGTH:
-                try:
-                    data = await self.reader.readexactly(self.EXTENDED_HEADER_LENGTH - stream.tell())
-                    stream.write(data)
-                except IncompleteReadError:
-                    raise ConnectionResetError
-            stream.seek(0)
-            return self.deserializer.deserialize_extended_message_header(stream)
-        return header
+        if self.closing:
+            raise ConnectionResetError  # Otherwise it will seem like a successful connection
 
     async def read_small_payload(self, stream: BytesIO, header: 'MessageHeader') -> bytes:
         assert self.reader is not None
@@ -149,71 +211,28 @@ class BitcoinClient:
         except IncompleteReadError:
             raise ConnectionResetError
 
+        hash = double_sha256(data)
+        if bytes.fromhex(header.checksum) != hash[:4]:
+            raise ValueError(f"Invalid checksum for message: {header.command}")
         stream.seek(0)
         return stream.read(header.length)
-
-    async def _session(self) -> None:
-        """raises `ConnectionResetError`"""
-        assert self.reader is not None
-
-        for i in range(self.MESSAGE_HANDLER_TASK_COUNT):
-            self.tasks.append(create_task(self.handle_message_task_async()))
-        self.tasks.append(create_task(self.keepalive()))
-        self.tasks.append(create_task(self.handshake(self.local_host, self.local_port)))
-
-        while True:
-            # Header
-            try:
-                stream = BytesIO()
-                data = await self.reader.readexactly(self.HEADER_LENGTH)
-                stream.seek(0, os.SEEK_END)
-                stream.write(data)
-            except IncompleteReadError:
-                raise ConnectionResetError
-
-            stream.seek(0)
-            header = await self.read_header(stream)
-
-            # Payload
-            stream = BytesIO()
-            if header.length < self.large_message_limit:
-                payload = await self.read_small_payload(stream, header)
-                if header.command == BLOCK:
-                    await self.handle_small_block(payload, header.length)
-                else:
-                    await self.message_queue.put((header.command, payload))
-            elif header.command == BLOCK:
-                await self.handle_big_block(stream, header.length)
-            else:
-                # tx, cmpctblock, blocktxn, getblocktxn can be large
-                payload = await self.read_small_payload(stream, header)
-                await self.message_queue.put((header.command, payload))
-
-    async def wait_for_connection(self) -> None:
-        """Keep retrying until the node comes online"""
-        # TODO exponential backoff
-        while True:
-            try:
-                await self.connect()
-                return
-            except ConnectionRefusedError:
-                self.logger.debug(
-                    f"Bitcoin node on:  {self.remote_host}:{self.remote_port} unavailable. "
-                    f"Waiting."
-                )
-                await asyncio.sleep(30)
 
     def send_message(self, message: bytes) -> None:
         assert self.writer is not None
         self.writer.write(message)
 
     async def close(self) -> None:
-        self.logger.info("Closing bitcoin p2p socket connection gracefully")
+        if self.closing:
+            return
+        self.logger.info(f"Closing connection gracefully: {self.host_string}")
         self.closing = True
+        if not self.handshake_complete_event.is_set():
+            self.handshake_complete_event.set()  # So self.connect() unblocks
         if self.writer and not self.writer.is_closing():
             self.writer.close()
-        self.connected = False
+            await asyncio.sleep(0)
         self.connection_lost_event.set()
+        await asyncio.sleep(0.2)
         for task in self.tasks:
             if not task.done():
                 task.cancel()
@@ -239,7 +258,7 @@ class BitcoinClient:
             if command == VERACK:
                 self.handshake_complete_event.set()
 
-    async def handle_big_block(self, stream: BytesIO, size: int) -> None:
+    async def handle_big_block(self, stream: BytesIO, size: int, header: MessageHeader) -> None:
         """The `on_block_chunk` allows for intercepting of the chunks of a larger block (possibly 4GB in size)
         whilst still in memory for:
         - writing chunks incrementally to disc
@@ -255,6 +274,7 @@ class BitcoinClient:
         tx_offsets_all: "array.ArrayType[int]" = array.array("Q")
         block_hash = bytes()
         adjustment = 0
+        sha256 = hashlib.sha256()
         while block_bytes_read < size:
             stream.seek(0, os.SEEK_END)
             try:
@@ -266,6 +286,7 @@ class BitcoinClient:
                 raise ConnectionResetError
             block_bytes_read += len(data)
             stream.write(data)
+            sha256.update(data)
 
             stream.seek(0)
             next_chunk = stream.read()
@@ -318,6 +339,11 @@ class BitcoinClient:
         )
         stream.seek(0, os.SEEK_END)
         assert stream.tell() == 0
+
+        first_hash = sha256.digest()
+        double_hash = hashlib.sha256(first_hash).digest()
+        if bytes.fromhex(header.checksum) != double_hash[:4]:
+            raise ValueError(f"Invalid checksum for block: {hash_to_hex_str(block_hash)}")
         await self.message_handler.on_block(block_data_msg, self)
 
     async def handle_small_block(self, buffer: bytes, size: int) -> None:
@@ -347,34 +373,28 @@ class BitcoinClient:
         )
         await self.message_handler.on_block(block_data_msg, self)
 
-    async def send_version(self, local_host: str, local_port: int) -> None:
+    async def send_version(self, local_host: str, local_port: int, height: int = 0) -> None:
         message = self.serializer.version(
             recv_host=self.remote_host,
             recv_port=self.remote_port,
             send_host=local_host,
             send_port=local_port,
             user_agent=self.user_agent,
-            relay=int(self.relay_transactions)
+            relay=int(self.relay_transactions),
+            height=height
         )
+        self.logger.debug(f"Sending version: {self.deserializer.version(BytesIO(message[self.HEADER_LENGTH:]))}")
         self.send_message(message)
 
-    async def handshake(self, local_host: str, local_port: int) -> None:
-        create_task(self.send_version(local_host, local_port))
+    async def handshake(self, local_host: str, local_port: int, height: int=0) -> None:
+        create_task(self.send_version(local_host, local_port, height))
         await self.handshake_complete_event.wait()
-
-    async def start_session(self) -> None:
-        """Reconnection logic needs to be managed by the ClientManager"""
-        try:
-            self.connection_lost_event.clear()  # If we are reconnecting, this might be set
-            await self._session()
-        except ConnectionResetError:
-            self.logger.error(f"Bitcoin node disconnected")
-        finally:
-            if self.writer and not self.writer.is_closing():
-                await self.close()
+        # self.send_message(self.serializer.getaddr())
 
     async def keepalive(self) -> None:
         await self.handshake_complete_event.wait()
+        if self.closing:
+            return
         self.logger.debug(f"Handshake event complete")
         await asyncio.sleep(2)
         while True:
@@ -388,7 +408,7 @@ class BitcoinClient:
         while not self.closing:
             await asyncio.sleep(2)
 
-    # Specialized methods for sending messages
+    # Helper functions
     async def broadcast_transaction(self, rawtx: bytes, wait_time: float=10.0,
             check_malformed: bool = True) -> Reject | None:
         """This method is part of the BitcoinClientMode.SIMPLE API for apps that care more
@@ -402,7 +422,7 @@ class BitcoinClient:
         listen to other peers for evidence that the transaction is being relayed around the
         network.
         """
-        if self.mode != BitcoinClientMode.SIMPLE:
+        if self.mode != BitcoinClientMode.HIGH_LEVEL:
             raise ValueError("This helper method is only available in BitcoinClientMode.SIMPLE mode")
 
         tx_hash = double_sha256(rawtx)
@@ -445,6 +465,7 @@ class BitcoinClient:
 
     async def get_headers(self, hash_count: int, block_locator_hashes: list[bytes],
             hash_stop: bytes) -> bytes | None:
+        """Returns a serialized p2p format `headers` message"""
         if not self.mode:
             raise ValueError("This helper method is only available in BitcoinClientMode.SIMPLE mode")
 
@@ -454,5 +475,35 @@ class BitcoinClient:
             hash_stop=hash_stop
         )
         self.send_message(message)
-        headers = await self.headers_queue.get()
-        return headers
+        return await self.headers_queue.get()
+
+    def reset_state(self) -> None:
+        self.writer = None
+        self.reader = None
+        self.closing = False
+        self.handshake_complete_event.clear()
+
+
+async def get_max_headers(client: BitcoinClient, headers_store: "HeadersStore") -> bytes | None:
+    block_locator_hashes = []
+    tip_height = headers_store.tip().height
+    with headers_store.headers_lock:
+        for i in range(0, 25, 2):
+            height = tip_height - i**2
+            if i == 0 or height > 0:
+                locator_hash = headers_store.get_header_for_height(height).hash
+                block_locator_hashes.append(locator_hash)
+        hash_count = len(block_locator_hashes)
+        return await client.get_headers(hash_count, block_locator_hashes, ZERO_HASH)
+
+
+async def wait_for_new_tip_reorg_aware(client: BitcoinClient, headers_store: 'HeadersStore') \
+        -> AsyncIterable['NewTipResult']:
+    while True:
+        inv_vect = await client.inv_queue_blocks.get()
+        for inv in inv_vect:
+            if inv["inv_type"] == InvType.BLOCK:
+                if not headers_store.have_header(hex_str_to_hash(inv['inv_hash'])):
+                    headers_message = await get_max_headers(client, headers_store)
+                    if headers_message:
+                        yield headers_store.connect_headers_reorg_safe(BytesIO(headers_message))
