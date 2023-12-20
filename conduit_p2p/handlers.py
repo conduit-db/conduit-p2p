@@ -9,7 +9,7 @@ import logging
 import typing
 from asyncio import QueueFull
 
-from bitcoinx import hash_to_hex_str, hex_str_to_hash, double_sha256
+from bitcoinx import hash_to_hex_str, hex_str_to_hash
 
 from .deserializer import Deserializer
 from .networks import NetworkConfig

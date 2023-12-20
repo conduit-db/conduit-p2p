@@ -144,11 +144,14 @@ class BitcoinClientManager:
         host, port = host_string.split(":")
         host = cast_to_valid_ipv4(host)  # important for dns resolution of docker container IP addresses
         assert self.concurrency > 0
+        have_blocks: set[bytes] = set()  # have_blocks should be shared state for the 'group'
         for i in range(self.concurrency):
             self.last_added_peer_id += 1
             client = BitcoinClient(id=self.last_added_peer_id, remote_host=host, remote_port=int(port),
                 message_handler=self.message_handler, mode=self.mode,
-                relay_transactions=self.relay_transactions, start_height=self.start_height)
+                relay_transactions=self.relay_transactions, start_height=self.start_height,
+            )
+            client.have_blocks = have_blocks
             self.clients.append(client)
         return client
 

@@ -3,14 +3,14 @@ import os
 from io import BytesIO
 import logging
 
-from bitcoinx import Header, MissingHeader, double_sha256, hash_to_hex_str
+from bitcoinx import Header, MissingHeader, hash_to_hex_str
 
 from conduit_p2p import BitcoinClientManager, HandlersDefault
 from conduit_p2p.client import BitcoinClient, get_max_headers, wait_for_new_tip_reorg_aware
 from conduit_p2p.constants import TESTNET, REGTEST, MAINNET, ZERO_HASH
 from conduit_p2p.deserializer import Inv
 from conduit_p2p.headers import HeadersStore, NewTipResult
-from conduit_p2p.types import BitcoinClientMode, InvType, BlockDataMsg, BlockType, BlockChunkData
+from conduit_p2p.types import BitcoinClientMode, InvType, BlockDataMsg, BlockChunkData
 from conduit_p2p.utils import create_task
 
 logging.basicConfig(format="%(asctime)-25s %(levelname)-10s %(name)-28s %(message)s")
@@ -49,12 +49,12 @@ class IndexerHandlers(HandlersDefault):
         are provided as chunks in the `on_block_chunk` callback."""
 
         block_hash = block_data_msg.block_hash
-        if block_data_msg.block_type == BlockType.SMALL_BLOCK:
-            self.logger.debug("Received small block with block_hash: %s (peer_id=%s)",
-                hash_to_hex_str(block_hash), peer.id)
-        else:
-            self.logger.debug("Received all big block chunks for block_hash: %s (peer_id=%s)",
-                hash_to_hex_str(block_hash), peer.id)
+        # if block_data_msg.block_type == BlockType.SMALL_BLOCK:
+        #     self.logger.debug("Received small block with block_hash: %s (peer_id=%s)",
+        #         hash_to_hex_str(block_hash), peer.id)
+        # else:
+        #     self.logger.debug("Received all big block chunks for block_hash: %s (peer_id=%s)",
+        #         hash_to_hex_str(block_hash), peer.id)
 
         if self.client_manager:
             self.client_manager.mark_block_done(block_hash)
@@ -110,13 +110,13 @@ async def get_wanted_block_data(wanted: list[Header], client_manager: BitcoinCli
         not_tried_yet_count = len(client_manager.get_connected_peers())
         while True:
             if len(client_manager.get_connected_peers()) < 1:
-                logger.debug(f"No available connected peers. Waiting")
+                # logger.debug(f"No available connected peers. Waiting")
                 await asyncio.sleep(10)
                 continue
 
             client = await client_manager.get_next_available_peer()
             if header.hash in client.have_blocks and header.hash in client_manager.wanted_blocks:
-                logger.debug(f"Sending getdata for block height: {header.height}")
+                # logger.debug(f"Sending getdata for block height: {header.height} (peer_id={client.id})")
                 message = client.serializer.getdata(
                     [Inv(inv_type=InvType.BLOCK, inv_hash=header.hex_str())])
                 client.send_message(message)
@@ -125,7 +125,11 @@ async def get_wanted_block_data(wanted: list[Header], client_manager: BitcoinCli
                 logger.debug(f"Block {header.height} not found in peer: {client.id}")
                 not_tried_yet_count -= 1
                 if not_tried_yet_count == 0:
-                    await asyncio.sleep(0.1)
+                    # When the blocks start getting bigger, it's probably
+                    # worth sacrificing on a longer sleep here just so that
+                    # all connected peers get sufficient time to respond with
+                    # their inventory of available blocks.
+                    await asyncio.sleep(0.5)
                     # Hopefully new connected peers which will immediately
                     # send a getblocks request to populate the `client.have_blocks`
                     not_tried_yet_count = len(client_manager.get_connected_peers())
