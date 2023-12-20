@@ -35,6 +35,6 @@ examples/headers.regtest
 examples/headers.testnet
 examples/peers.mainnet.json
 examples/peers.testnet.json
-/examples/peers.regtest.json
-/examples/headers.blocks.regtest
-/examples/headers.blocks.testnet
+examples/peers.regtest.json
+examples/headers.blocks.regtest
+examples/headers.blocks.testnet

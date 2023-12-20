@@ -27,14 +27,13 @@ from .types import (
     BlockDataMsg, BitcoinClientMode, Reject, InvType,
 )
 from .commands import BLOCK, EXTMSG, VERACK
-from .deserializer import MessageHeader
+from .deserializer import MessageHeader, Inv
 from .utils import create_task
 
 MODULE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 if typing.TYPE_CHECKING:
     from .handlers import HandlersDefault
-    from .deserializer import Inv
     from .headers import HeadersStore, NewTipResult
 
 logger = logging.getLogger(f"conduit.p2p.client")
@@ -108,12 +107,18 @@ class BitcoinClient:
         assert isinstance(self.start_height, int)
         # If BitcoinClientMode.SIMPLE is set then messages are passed to these queues
         self.headers_queue: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=100)
-        self.inv_queue_blocks: asyncio.Queue[list[Inv]] = asyncio.Queue(maxsize=100)
+        self.blocks_queue: asyncio.Queue[BlockChunkData | BlockDataMsg] = asyncio.Queue(maxsize=100)
+
+        self.inv_queue_blocks: asyncio.Queue[list[Inv]] = asyncio.Queue(maxsize=100)  # Headers
         # On tx broadcast wait for Rejection. Correlation with tx_hash is necessary
         # to enable concurrent usage of the broadcast_transaction method
         self.tx_reject_queue_map: dict[bytes, Reject | None] = {}  # tx_hash -> Reject
 
         self.tasks: list[Task[Any]] = []
+
+        # Could be TX or BLOCK type but probably BLOCK type
+        self.have_blocks: set[bytes] = set()
+        self.queued_getdata_requests: asyncio.Queue[bytes] = asyncio.Queue(maxsize=100)
 
     async def __aenter__(self) -> 'BitcoinClient':
         await self.connect()
@@ -467,7 +472,7 @@ class BitcoinClient:
             hash_stop: bytes) -> bytes | None:
         """Returns a serialized p2p format `headers` message"""
         if not self.mode:
-            raise ValueError("This helper method is only available in BitcoinClientMode.SIMPLE mode")
+            raise ValueError("This helper method is only available in BitcoinClientMode.HIGH_LEVEL mode")
 
         message = self.serializer.getheaders(
             hash_count=hash_count,
@@ -502,8 +507,8 @@ async def wait_for_new_tip_reorg_aware(client: BitcoinClient, headers_store: 'He
     while True:
         inv_vect = await client.inv_queue_blocks.get()
         for inv in inv_vect:
-            if inv["inv_type"] == InvType.BLOCK:
-                if not headers_store.have_header(hex_str_to_hash(inv['inv_hash'])):
-                    headers_message = await get_max_headers(client, headers_store)
-                    if headers_message:
-                        yield headers_store.connect_headers_reorg_safe(BytesIO(headers_message))
+            assert inv["inv_type"] == InvType.BLOCK
+            if not headers_store.have_header(hex_str_to_hash(inv['inv_hash'])):
+                headers_message = await get_max_headers(client, headers_store)
+                if headers_message:
+                    yield headers_store.connect_headers_reorg_safe(BytesIO(headers_message))

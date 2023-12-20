@@ -143,6 +143,7 @@ class Serializer:
             block_locator_hashes: List[bytes],
             hash_stop: bytes = ZERO_HASH,
     ) -> bytes:
+        assert hash_count == len(block_locator_hashes)
         version = pack_le_uint32(70016)
         hash_count = pack_varint(hash_count)
         hashes = bytearray()

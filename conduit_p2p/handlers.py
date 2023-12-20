@@ -9,12 +9,12 @@ import logging
 import typing
 from asyncio import QueueFull
 
-from bitcoinx import hash_to_hex_str, double_sha256, hex_str_to_hash
+from bitcoinx import hash_to_hex_str, hex_str_to_hash, double_sha256
 
 from .deserializer import Deserializer
 from .networks import NetworkConfig
 from .serializer import Serializer
-from .types import BlockChunkData, BlockDataMsg, BlockType, InvType, BitcoinClientMode
+from .types import BlockChunkData, BlockDataMsg, InvType, BitcoinClientMode, BlockType
 
 if typing.TYPE_CHECKING:
     from .client_manager import BitcoinClientManager
@@ -121,11 +121,17 @@ class HandlersDefault(abc.ABC):
             # BLOCK
             try:
                 if inv_vect_blocks:
+                    # This for waiting on new tip headers (filters out ones we already have)
                     peer.inv_queue_blocks.put_nowait(inv_vect_blocks)
             except QueueFull:
-                self.logger.warning("Inv queue is full. Are you draining it? "
+                self.logger.warning("Queue `inv_queue_blocks` is full. Are you draining it? "
                                     "This will block all handler tasks until it is cleared!")
                 await peer.inv_queue_blocks.put(inv_vect_blocks)
+
+            if inv_vect_blocks:
+                for inv in inv_vect_blocks:
+                    # self.logger.debug(f"Adding block: {inv['inv_hash']} to peer: {peer.id}")
+                    peer.have_blocks.add(hex_str_to_hash(inv['inv_hash']))
 
     async def on_getdata(self, message: bytes, peer: 'BitcoinClient') -> None:
         getdata = self.deserializer.getdata(io.BytesIO(message))
@@ -171,10 +177,14 @@ class HandlersDefault(abc.ABC):
     async def on_block(self, block_data_msg: BlockDataMsg, peer: 'BitcoinClient') -> None:
         """Small blocks are provided as one blob, whereas big blocks (exceeding LARGE_MESSAGE_LIMIT)
         are provided as chunks in the `on_block_chunk` callback."""
-        block_hash = double_sha256(block_data_msg.block_hash)
+
+        block_hash = block_data_msg.block_hash
         if block_data_msg.block_type == BlockType.SMALL_BLOCK:
             self.logger.debug("Received small block with block_hash: %s (peer_id=%s)",
                 hash_to_hex_str(block_hash), peer.id)
         else:
             self.logger.debug("Received all big block chunks for block_hash: %s (peer_id=%s)",
                 hash_to_hex_str(block_hash), peer.id)
+
+        if self.client_manager:
+            self.client_manager.mark_block_done(block_hash)
