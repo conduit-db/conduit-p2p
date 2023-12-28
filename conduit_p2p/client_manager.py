@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Iterable
 from random import random
 
-from bitcoinx import double_sha256, hex_str_to_hash
+from bitcoinx import double_sha256, hex_str_to_hash, Header
 
 from .client import BitcoinClient, DEFAULT_LARGE_MESSAGE_LIMIT
 from .deserializer import Inv
@@ -84,13 +84,17 @@ class BitcoinClientManager:
         for host_string in self.addresses:
             self.add_client(host_string)
 
-        self._connection_pool: set[BitcoinClient] = set()
+        self._connection_pool: list[BitcoinClient] = []
         self._disconnected_pool: set[BitcoinClient] = set()
         self._currently_selected_peer_index: int = 0
+        self._currently_selected_available_peer_index: int = 0
 
         # On tx broadcast, record acceptance by other peers
         self.tx_inv_queue_map: dict[bytes, list[int]] = {}  # tx_hash -> list[BitcoinClient.id]
         self.tx_inv_queue: asyncio.Queue[tuple[list[Inv], BitcoinClient]] = asyncio.Queue(maxsize=100)
+        self.wanted_blocks: set[bytes] = set()
+        self.wanted_block_first: Header | None = None
+        self.wanted_block_last: Header | None = None
 
     async def __aenter__(self) -> "BitcoinClientManager":
         await self.connect_all_peers(self.wait_for_n_peers)
@@ -103,6 +107,7 @@ class BitcoinClientManager:
         return len(self._connection_pool)
 
     def read_peers_file(self) -> dict[str, PeerInfo]:
+        """Because the key is the host_string, it will automatically de-duplicate"""
         if not self.peers_filepath.exists():
             self.peers_dir.mkdir(parents=True, exist_ok=True)
             self.peers_filepath.touch(exist_ok=True)
@@ -115,9 +120,14 @@ class BitcoinClientManager:
         return self.addresses
 
     def write_peers_file(self) -> None:
-        """Completely overwrites the file every time. Low-tech solution."""
+        """Completely overwrites the file every time. Low-tech solution.
+        Because the key is the host_string, it will automatically de-duplicate"""
         with open(self.peers_filepath, 'w') as file:
             file.write(json.dumps(self.addresses, indent=4))
+
+    def mark_block_done(self, block_hash: bytes) -> None:
+        if block_hash in self.wanted_blocks:
+            self.wanted_blocks.remove(block_hash)
 
     def add_client(self, host_string: str) -> BitcoinClient | None:
         if host_string not in self.addresses:
@@ -134,11 +144,14 @@ class BitcoinClientManager:
         host, port = host_string.split(":")
         host = cast_to_valid_ipv4(host)  # important for dns resolution of docker container IP addresses
         assert self.concurrency > 0
+        have_blocks: set[bytes] = set()  # have_blocks should be shared state for the 'group'
         for i in range(self.concurrency):
             self.last_added_peer_id += 1
             client = BitcoinClient(id=self.last_added_peer_id, remote_host=host, remote_port=int(port),
                 message_handler=self.message_handler, mode=self.mode,
-                relay_transactions=self.relay_transactions, start_height=self.start_height)
+                relay_transactions=self.relay_transactions, start_height=self.start_height,
+            )
+            client.have_blocks = have_blocks
             self.clients.append(client)
         return client
 
@@ -149,8 +162,18 @@ class BitcoinClientManager:
         else:
             self._currently_selected_peer_index += 1
 
-    def get_connected_peers(self) -> set[BitcoinClient]:
+    def select_next_available_peer(self) -> None:
+        """This will iterate through all available clients"""
+        if self._currently_selected_available_peer_index == len(self._connection_pool) - 1:
+            self._currently_selected_available_peer_index = 0
+        else:
+            self._currently_selected_available_peer_index += 1
+
+    def get_connected_peers(self) -> list[BitcoinClient]:
         return self._connection_pool
+
+    def get_disconnected_peers(self) -> set[BitcoinClient]:
+        return self._disconnected_pool
 
     def get_next_peer(self) -> BitcoinClient:
         self.select_next_peer()
@@ -160,14 +183,8 @@ class BitcoinClientManager:
         while len(self._connection_pool) < 1:
             self._logger.info(f"Waiting for peers to connect")
             await asyncio.sleep(1)
-        client = self.get_next_peer()
-        while client not in self.get_connected_peers():
-            self._logger.debug(f"Peer {client.id} is unavailable. Selecting next peer")
-            client = self.get_next_peer()
-            if not self.get_connected_peers():
-                self._logger.debug(f"No available peers. Waiting")
-                await asyncio.sleep(1)  # avoid spinning
-        return client
+        self.select_next_available_peer()
+        return self.get_current_available_peer()
 
     def _reallocate_outstanding_getdatas(self, client: BitcoinClient) -> None:
         """This includes headers, txs, blocks"""
@@ -177,7 +194,35 @@ class BitcoinClientManager:
         """This peer might be disconnected. Requires filtering"""
         return self.clients[self._currently_selected_peer_index]
 
+    def get_current_available_peer(self) -> BitcoinClient:
+        """This peer might be disconnected. Requires filtering"""
+        return self._connection_pool[self._currently_selected_available_peer_index]
+
+    async def reallocate_work_task(self, client: BitcoinClient) -> None:
+        allocated_getdatas = []
+        while True:
+            try:
+                item = client.queued_getdata_requests.get_nowait()
+                allocated_getdatas.append(item)
+            except asyncio.QueueEmpty:
+                break
+        # If none are available it will block here and wait until at least
+        # 1 peer becomes available
+        available_client = await self.get_next_available_peer()
+        for item in allocated_getdatas:
+            await available_client.queued_getdata_requests.put(item)
+            # This will populate the BitcoinClient's have_blocks cache
+            if self.wanted_blocks:
+                assert self.wanted_block_first is not None
+                assert self.wanted_block_last is not None
+                message = self.serializer.getblocks(len([self.wanted_block_first.hash]), [self.wanted_block_first.hash],
+                    self.wanted_block_last.hash)
+                available_client.send_message(message)
+
     async def connect_task(self, client: BitcoinClient) -> None:
+        """On a disconnection, if the BitcoinClient has `queued_getdata_requests` it must
+        be re-allocated otherwise the indexing process will hang waiting for the block data
+        to be returned that never comes."""
         self._disconnected_pool.add(client)
         sleep_times = [5, 30, 90, 180, 600]  # Sleep 10 minutes for each retry thereafter
 
@@ -198,18 +243,31 @@ class BitcoinClientManager:
                 sleep_index = 0
                 self._logger.info(f"Connected to peer: {client.host_string}")
                 self._disconnected_pool.remove(client)
-                self._connection_pool.add(client)
+                if client not in self._connection_pool:
+                    self._connection_pool.append(client)
                 self.addresses[client.host_string]['last_connected'] = int(time.time())
                 self.write_peers_file()
+                if self.wanted_blocks:
+                    # getblocks will populate the BitcoinClient.has_blocks cache
+                    # with block hashes to know what it has available of the
+                    # ones that we want
+                    assert self.wanted_block_first is not None
+                    assert self.wanted_block_last is not None
+                    message = self.serializer.getblocks(len([self.wanted_block_first.hash]),
+                        [self.wanted_block_first.hash], self.wanted_block_last.hash)
+                    client.send_message(message)
+
                 await client.connection_lost_event.wait()
                 client.connection_lost_event.clear()
                 self._logger.info(f"Peer at: {client.remote_host}:{client.remote_port} disconnected gracefully. "
                                   f"Retry in {sleep_times[sleep_index]} seconds.")
+                if client.queued_getdata_requests.qsize() > 0:
+                    create_task(self.reallocate_work_task(client))
 
             # Was connected.
+            self._logger.debug(f"Removing disconnected peer {client.id} from connection pool")
             if client in self._connection_pool:
                 self._connection_pool.remove(client)
-                # self._reallocate_outstanding_getdatas(client)
             self._disconnected_pool.add(client)
 
             await asyncio.sleep(sleep_times[sleep_index])

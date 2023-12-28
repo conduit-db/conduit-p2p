@@ -9,7 +9,7 @@ __all__ = (
     'BitcoinClient', 'BitcoinClientManager', 'REGTEST',
     'MAINNET', 'TESTNET', 'SCALINGTESTNET', 'ZERO_HASH', 'MsgType',
     'Deserializer', 'HandlersDefault', 'NetworkConfig', 'Serializer',
-    'BitcoinClientMode'
+    'BitcoinClientMode', 'HeadersStore'
 )
 
 from conduit_p2p.client import BitcoinClient
@@ -20,3 +20,4 @@ from conduit_p2p.handlers import HandlersDefault
 from conduit_p2p.networks import NetworkConfig
 from conduit_p2p.serializer import Serializer
 from conduit_p2p.types import BitcoinClientMode
+from conduit_p2p.headers import HeadersStore

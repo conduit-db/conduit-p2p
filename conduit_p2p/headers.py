@@ -10,7 +10,7 @@ import threading
 from typing import cast, NamedTuple
 
 import bitcoinx
-from bitcoinx import Headers, MissingHeader, Header, Chain, double_sha256
+from bitcoinx import Headers, MissingHeader, Header, Chain, double_sha256, hash_to_hex_str
 
 from conduit_p2p import NetworkConfig
 
@@ -127,9 +127,15 @@ class HeadersStore:
         try:
             if lock:
                 self.headers_lock.acquire()
-            header, chain = self.headers.lookup(block_hash)
-            if header is None:
-                raise MissingHeader
+            # The bitcoinx Headers.lookup method API has changed in v0.8
+            # it used to return a tuple[Header, Chain] and raise MissingHeader if no header
+            # was found. This allows us to expose the same API from app_state.lookup as before.
+            chain: Chain
+            chain, height = self.headers.lookup(block_hash)
+            if chain is None:
+                raise MissingHeader(f"No header found for hash: "
+                    f"{hash_to_hex_str(block_hash)}")
+            header = chain.header_at_height(height)
             return header
         finally:
             if lock:
