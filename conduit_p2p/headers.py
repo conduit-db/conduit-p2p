@@ -57,6 +57,9 @@ class HeadersStore:
         self.headers, self.cursor = self.read_cached_headers()
         self.headers_lock = threading.RLock()
 
+    def flush(self) -> None:
+        self.write_cached_headers()
+
     def write_cached_headers(self) -> HeaderPersistenceCursor:
         with open(self.file_path, "ab") as hf:
             hf.write(self.headers.unpersisted_headers(self.cursor))
